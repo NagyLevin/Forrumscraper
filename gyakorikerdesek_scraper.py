@@ -9,10 +9,10 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 BASE_URL = "https://www.gyakorikerdesek.hu"
 
-# pl:
+# Példa:
 # /allatok__egyeb-kerdesek__13193139-milyen-lenne-a-vadaszat-ha-nyul-is-vissza-tudna-loni
 QUESTION_PATH_RE = re.compile(
-    r"^/allatok__[a-z0-9\-]+__\d+(?:-[^/?#]+)?$",
+    r"^/allatok__[a-z0-9\-]+__(\d+)(?:-[^/?#]+)?$",
     re.IGNORECASE
 )
 
@@ -27,23 +27,54 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 
-def load_visited_titles(path: Path) -> Set[str]:
-    visited = set()
-    if path.exists():
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = normalize_text(line)
-                if line:
-                    visited.add(line)
-    return visited
+def extract_topic_id_from_url(url: str) -> Optional[str]:
+    if not url:
+        return None
+
+    path = url
+    if url.startswith(BASE_URL):
+        path = url[len(BASE_URL):]
+
+    match = QUESTION_PATH_RE.match(path)
+    if not match:
+        return None
+
+    return match.group(1)
 
 
-def append_visited_title(path: Path, title: str) -> None:
-    title = normalize_text(title)
-    if not title:
+def load_visited_topic_ids(path: Path) -> Set[str]:
+    visited_ids = set()
+
+    if not path.exists():
+        return visited_ids
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Formátum:
+            # topic_id<TAB>url<TAB>title
+            parts = line.split("\t")
+            topic_id = parts[0].strip()
+
+            if topic_id:
+                visited_ids.add(topic_id)
+
+    return visited_ids
+
+
+def append_visited_topic(path: Path, topic_id: str, topic_url: str, topic_title: str) -> None:
+    topic_id = normalize_text(topic_id)
+    topic_url = normalize_text(topic_url)
+    topic_title = normalize_text(topic_title)
+
+    if not topic_id:
         return
+
     with path.open("a", encoding="utf-8") as f:
-        f.write(title + "\n")
+        f.write(f"{topic_id}\t{topic_url}\t{topic_title}\n")
         f.flush()
 
 
@@ -84,13 +115,6 @@ async def human_click(page, locator) -> None:
     await human_pause(0.7, 1.4)
 
 
-async def safe_inner_text(locator) -> str:
-    try:
-        return normalize_text(await locator.inner_text())
-    except Exception:
-        return ""
-
-
 async def get_first_text(locator, default: str = "") -> str:
     try:
         if await locator.count() > 0:
@@ -101,9 +125,45 @@ async def get_first_text(locator, default: str = "") -> str:
     return default
 
 
+async def extract_author_from_box(box) -> str:
+    # Először a teljes fejlécet próbáljuk olvasni
+    header_text = await get_first_text(
+        box.locator(".valasz_fejlec, .valaszFejlec"),
+        default=""
+    )
+
+    if header_text:
+        # Példák:
+        # "1/5 anonim válasza:"
+        # "2/5 Mad Max2 válasza:"
+        m = re.search(r"^\s*\d+/\d+\s+(.+?)\s+válasza:", header_text, re.IGNORECASE)
+        if m:
+            return normalize_text(m.group(1))
+
+        # Fallback: ha benne van az anonim szó
+        if "anonim" in header_text.lower():
+            return "anonim"
+
+    # Második fallback: külön elemekből próbáljuk
+    author = await get_first_text(
+        box.locator(
+            ".valasz_fejlec .anonim, "
+            ".valasz_fejlec a, "
+            ".valaszFejlec .anonim, "
+            ".valaszFejlec a"
+        ),
+        default=""
+    )
+
+    if author:
+        return author
+
+    return "ismeretlen"
+
+
 async def collect_topics_from_list(page) -> List[Dict[str, str]]:
     topics: List[Dict[str, str]] = []
-    seen_urls = set()
+    seen_ids_on_page = set()
 
     links = page.locator("a[href]")
     count = await links.count()
@@ -129,18 +189,21 @@ async def collect_topics_from_list(page) -> List[Dict[str, str]]:
         if "__oldal-" in full_url:
             continue
 
-        if not QUESTION_PATH_RE.match(path):
+        match = QUESTION_PATH_RE.match(path)
+        if not match:
             continue
 
-        if full_url in seen_urls:
+        topic_id = match.group(1)
+        if not topic_id or topic_id in seen_ids_on_page:
             continue
 
         title = normalize_text(await link.inner_text())
         if not title:
             continue
 
-        seen_urls.add(full_url)
+        seen_ids_on_page.add(topic_id)
         topics.append({
+            "id": topic_id,
             "title": title,
             "url": full_url
         })
@@ -159,6 +222,7 @@ async def find_topic_link(page, target_url: str):
             continue
 
         href = href.strip()
+
         if href.startswith("/"):
             full_url = BASE_URL + href
         else:
@@ -178,13 +242,11 @@ async def open_topic_by_click(page, topic_url: str, link_locator) -> bool:
     except Exception:
         return False
 
-    # Várunk egy kicsit, hátha átmegy kérdésoldalra
     for _ in range(40):
         await asyncio.sleep(0.25)
         if page.url != old_url:
             break
 
-    # Ha nem változott az URL, fallback: direkt goto
     if page.url == old_url:
         try:
             await page.goto(topic_url, wait_until="domcontentloaded", timeout=60000)
@@ -217,15 +279,7 @@ async def scrape_current_topic(page) -> Optional[Dict[str, object]]:
     for i in range(answer_count):
         box = answer_boxes.nth(i)
 
-        author = await get_first_text(
-            box.locator(
-                ".valasz_fejlec .anonim, "
-                ".valasz_fejlec a, "
-                ".valaszFejlec .anonim, "
-                ".valaszFejlec a"
-            ),
-            default="ismeretlen"
-        )
+        author = await extract_author_from_box(box)
 
         text = await get_first_text(
             box.locator(
@@ -268,17 +322,24 @@ async def go_back_to_list(page, list_url: str) -> None:
     await human_pause(0.8, 1.8)
 
 
-async def process_topic(page, list_url: str, topic: Dict[str, str], output_handle, visited_file: Path, visited_titles: Set[str]) -> None:
+async def process_topic(
+    page,
+    list_url: str,
+    topic: Dict[str, str],
+    output_handle,
+    visited_file: Path,
+    visited_topic_ids: Set[str]
+) -> None:
+    topic_id = topic["id"]
     topic_title = normalize_text(topic["title"])
     topic_url = topic["url"]
 
-    if topic_title in visited_titles:
-        print(f"[SKIP] Már feldolgozva: {topic_title}")
+    if topic_id in visited_topic_ids:
+        print(f"[SKIP] Már feldolgozva (ID): {topic_id} | {topic_title}")
         return
 
     print(f"[INFO] Feldolgozás: {topic_title}")
 
-    # újratöltjük a listaoldalt, hogy biztos friss DOM legyen
     await page.goto(list_url, wait_until="domcontentloaded", timeout=60000)
     await human_pause(1.0, 2.0)
 
@@ -301,11 +362,19 @@ async def process_topic(page, list_url: str, topic: Dict[str, str], output_handl
     real_title = normalize_text(str(data["title"]))
     comments = data["comments"]
 
-    write_topic_to_file(output_handle, real_title, comments)
-    append_visited_title(visited_file, real_title)
-    visited_titles.add(real_title)
+    real_topic_id = extract_topic_id_from_url(page.url) or topic_id
+    real_topic_url = page.url
 
-    print(f"[OK] Mentve: {real_title} | kommentek: {len(comments)}")
+    if real_topic_id in visited_topic_ids:
+        print(f"[SKIP] Már mentve volt közben: {real_topic_id} | {real_title}")
+        await go_back_to_list(page, list_url)
+        return
+
+    write_topic_to_file(output_handle, real_title, comments)
+    append_visited_topic(visited_file, real_topic_id, real_topic_url, real_title)
+    visited_topic_ids.add(real_topic_id)
+
+    print(f"[OK] Mentve: {real_title} | ID: {real_topic_id} | kommentek: {len(comments)}")
 
     await human_pause(1.0, 2.0)
     await go_back_to_list(page, list_url)
@@ -315,7 +384,12 @@ async def main():
     parser = argparse.ArgumentParser(description="GyakoriKérdések Állatok scraper Playwrighttal")
     parser.add_argument("--start", type=int, required=True, help="Kezdő oldal száma")
     parser.add_argument("--end", type=int, required=True, help="Utolsó oldal száma")
-    parser.add_argument("--output", type=str, default="allatok.txt", help="Output fájl útvonala")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="scraper_output",
+        help="Output mappa neve vagy útvonala"
+    )
     parser.add_argument("--headless", action="store_true", help="Headless mód")
     args = parser.parse_args()
 
@@ -324,15 +398,18 @@ async def main():
     if args.end < args.start:
         raise ValueError("A --end nem lehet kisebb, mint a --start.")
 
-    output_path = Path(args.output).expanduser().resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(args.output).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    visited_file = output_path.parent / "visited_topics.txt"
-    visited_titles = load_visited_titles(visited_file)
+    output_file = output_dir / "allatok.txt"
+    visited_file = output_dir / "visited_topics.txt"
 
-    print(f"[INFO] Output: {output_path}")
-    print(f"[INFO] Visited: {visited_file}")
-    print(f"[INFO] Már ismert topicok: {len(visited_titles)}")
+    visited_topic_ids = load_visited_topic_ids(visited_file)
+
+    print(f"[INFO] Output mappa: {output_dir}")
+    print(f"[INFO] Output fájl: {output_file}")
+    print(f"[INFO] Visited fájl: {visited_file}")
+    print(f"[INFO] Már ismert topic ID-k: {len(visited_topic_ids)}")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -351,8 +428,7 @@ async def main():
 
         page = await context.new_page()
 
-        # append mód
-        with output_path.open("a", encoding="utf-8") as output_handle:
+        with output_file.open("a", encoding="utf-8") as output_handle:
             for page_num in range(args.start, args.end + 1):
                 list_url = build_list_url(page_num)
                 print(f"\n[INFO] === {page_num}. OLDAL: {list_url} ===")
@@ -366,10 +442,12 @@ async def main():
 
                     for idx, topic in enumerate(topics, start=1):
                         title = normalize_text(topic["title"])
+                        topic_id = topic["id"]
+
                         print(f"[INFO] {idx}/{len(topics)} -> {title}")
 
-                        if title in visited_titles:
-                            print(f"[SKIP] Már visited-ben van: {title}")
+                        if topic_id in visited_topic_ids:
+                            print(f"[SKIP] Már visited-ben van: {topic_id} | {title}")
                             continue
 
                         try:
@@ -379,7 +457,7 @@ async def main():
                                 topic=topic,
                                 output_handle=output_handle,
                                 visited_file=visited_file,
-                                visited_titles=visited_titles
+                                visited_topic_ids=visited_topic_ids
                             )
                         except PlaywrightTimeoutError:
                             print(f"[HIBA] Timeout ennél a topicnál: {topic['url']}")
@@ -406,9 +484,9 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
+    
     #TODO:
-    #Külkön mappa a cuccoknak
+  
     #100% és stb ne legyen benne a kimeneti fájlban
     #esetleg [link] kiszedése a kommentekből
     
