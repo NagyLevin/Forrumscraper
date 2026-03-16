@@ -1,215 +1,186 @@
 import argparse
+import asyncio
+import random
 import re
-import time
-from pathlib import Path
-from typing import List, Tuple
-from urllib.parse import urljoin
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-import requests
-from bs4 import BeautifulSoup
+BASE_URL = "https://www.gyakorikerdesek.hu"
 
-BASE = "https://www.gyakorikerdesek.hu"
-CATEGORY = "/allatok"
-OUTPUT_FILE = "allatok.txt"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    )
-}
-
-QUESTION_LINK_RE = re.compile(r"^/allatok__[^/]+__\d+-")
-ANSWER_PAGE_RE = re.compile(r"__oldal-(\d+)$")
-MULTISPACE_RE = re.compile(r"\s+")
+# Példa:
+# /allatok__egyeb-kerdesek__1234567-kerdes-szovege
+QUESTION_PATH_RE = re.compile(
+    r"^/allatok__[a-z0-9\-]+__\d+(?:-[^/?#]+)?$",
+    re.IGNORECASE
+)
 
 
-def clean_text(text: str) -> str:
-    text = text.replace("\xa0", " ")
-    text = MULTISPACE_RE.sub(" ", text)
-    return text.strip()
+def build_list_url(page_num: int) -> str:
+    if page_num == 1:
+        return f"{BASE_URL}/allatok"
+    return f"{BASE_URL}/allatok__oldal-{page_num}"
 
 
-class Scraper:
-    def __init__(self, start_page: int, end_page: int, delay: float = 1.0) -> None:
-        self.start_page = start_page
-        self.end_page = end_page
-        self.delay = delay
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
-        self.seen_questions = set()
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
-    def fetch(self, url: str) -> requests.Response:
-        response = self.session.get(url, timeout=30)
-        response.raise_for_status()
-        response.encoding = response.apparent_encoding or response.encoding
-        time.sleep(self.delay)
-        return response
 
-    def category_url(self, page_no: int) -> str:
-        if page_no == 1:
-            return urljoin(BASE, CATEGORY)
-        return urljoin(BASE, f"{CATEGORY}__oldal-{page_no}")
+async def human_sleep(min_s: float = 1.0, max_s: float = 2.0) -> None:
+    await asyncio.sleep(random.uniform(min_s, max_s))
 
-    def get_question_links(self, page_url: str) -> List[str]:
-        response = self.fetch(page_url)
-        soup = BeautifulSoup(response.text, "html.parser")
 
-        links: List[str] = []
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if not QUESTION_LINK_RE.match(href):
-                continue
-            if ANSWER_PAGE_RE.search(href):
-                continue
-            full_url = urljoin(BASE, href)
-            if full_url in self.seen_questions:
-                continue
-            self.seen_questions.add(full_url)
-            links.append(full_url)
-        return links
+async def collect_question_urls(page) -> list[str]:
+    urls = []
+    seen = set()
 
-    def extract_author(self, answer_box) -> str:
-        header = answer_box.select_one(".valasz_fejlec")
-        if header:
-            author_elt = (
-                header.select_one(".anonim")
-                or header.select_one("a")
-                or header.select_one("span")
+    links = page.locator("a[href]")
+    count = await links.count()
+
+    for i in range(count):
+        href = await links.nth(i).get_attribute("href")
+        if not href:
+            continue
+
+        href = href.strip()
+
+        if href.startswith("/"):
+            path = href
+            full_url = BASE_URL + href
+        elif href.startswith(BASE_URL):
+            full_url = href
+            path = href.replace(BASE_URL, "", 1)
+        else:
+            continue
+
+        if "__oldal-" in full_url:
+            continue
+
+        if QUESTION_PATH_RE.match(path) and full_url not in seen:
+            seen.add(full_url)
+            urls.append(full_url)
+
+    return urls
+
+
+async def get_first_text(locator, default: str = "") -> str:
+    try:
+        if await locator.count() > 0:
+            text = await locator.first.inner_text()
+            return normalize_text(text)
+    except Exception:
+        pass
+    return default
+
+
+async def scrape_question(page, url: str, file_handle) -> None:
+    print(f"[INFO] --> Kérdés megnyitása: {url}")
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_selector("h1", timeout=15000)
+        await human_sleep(1.2, 2.5)
+
+        title = await get_first_text(page.locator("h1"))
+        if not title:
+            print(f"[WARN] Nincs cím ezen az oldalon: {url}")
+            return
+
+        file_handle.write(f"Post: {title}\n")
+
+        answer_boxes = page.locator("div.valasz")
+        answer_count = await answer_boxes.count()
+
+        if answer_count == 0:
+            print(f"[WARN] Nem találtam válaszokat: {url}")
+
+        for i in range(answer_count):
+            box = answer_boxes.nth(i)
+
+            author = await get_first_text(
+                box.locator(
+                    ".valasz_fejlec .anonim, "
+                    ".valasz_fejlec a, "
+                    ".valaszFejlec .anonim, "
+                    ".valaszFejlec a"
+                ),
+                default="ismeretlen"
             )
-            if author_elt:
-                author = clean_text(author_elt.get_text(" ", strip=True))
-                if author:
-                    return author
 
-            header_text = clean_text(header.get_text(" ", strip=True))
-            match = re.search(r"\d+/\d+\s+(.*?)\s+válasza:?", header_text, re.IGNORECASE)
-            if match:
-                return clean_text(match.group(1))
+            text = await get_first_text(
+                box.locator(
+                    ".valasz_valasz, "
+                    ".valaszValasz, "
+                    ".valasz_szoveg, "
+                    ".valaszSzoveg"
+                )
+            )
 
-        return "ismeretlen"
-
-    def extract_answers_from_soup(self, soup: BeautifulSoup) -> List[Tuple[str, str]]:
-        answers: List[Tuple[str, str]] = []
-        for box in soup.select("div.valasz"):
-            header = box.select_one(".valasz_fejlec")
-            body = box.select_one(".valasz_valasz")
-            if not header or not body:
-                continue
-
-            author = self.extract_author(box)
-            text = clean_text(body.get_text("\n", strip=True))
             if text:
-                answers.append((author, text))
-        return answers
+                file_handle.write(f"Comment by {author}: {text}\n")
 
-    def scrape_question(self, question_url: str) -> Tuple[str, List[Tuple[str, str]]]:
-        response = self.fetch(question_url)
-        soup = BeautifulSoup(response.text, "html.parser")
+        file_handle.write("-" * 80 + "\n")
+        file_handle.flush()
 
-        title_elt = soup.find("h1")
-        title = clean_text(title_elt.get_text(" ", strip=True)) if title_elt else question_url
-
-        all_answers: List[Tuple[str, str]] = []
-        seen_pairs = set()
-
-        page_no = 1
-        while True:
-            current_url = question_url if page_no == 1 else f"{question_url}__oldal-{page_no}"
-            try:
-                page_response = response if page_no == 1 else self.fetch(current_url)
-            except requests.HTTPError as exc:
-                if exc.response is not None and exc.response.status_code == 404:
-                    break
-                raise
-
-            page_soup = soup if page_no == 1 else BeautifulSoup(page_response.text, "html.parser")
-            page_answers = self.extract_answers_from_soup(page_soup)
-            if not page_answers and page_no > 1:
-                break
-
-            new_count = 0
-            for author, text in page_answers:
-                key = (author, text)
-                if key in seen_pairs:
-                    continue
-                seen_pairs.add(key)
-                all_answers.append((author, text))
-                new_count += 1
-
-            if page_no > 1 and new_count == 0:
-                break
-
-            page_no += 1
-
-        return title, all_answers
-
-    def save_posts(self, output_path: Path) -> None:
-        with output_path.open("w", encoding="utf-8") as f:
-            for page_no in range(self.start_page, self.end_page + 1):
-                page_url = self.category_url(page_no)
-                print(f"[INFO] Oldal feldolgozása: {page_url}")
-
-                try:
-                    question_links = self.get_question_links(page_url)
-                except requests.HTTPError as exc:
-                    status = exc.response.status_code if exc.response is not None else "?"
-                    print(f"[HIBA] A listaoldal nem tölthető be ({status}): {page_url}")
-                    continue
-
-                if not question_links:
-                    print(f"[INFO] Nincs több kérdés ezen az oldalon: {page_url}")
-                    continue
-
-                for index, question_url in enumerate(question_links, start=1):
-                    print(f"[INFO]   {index}/{len(question_links)} kérdés: {question_url}")
-                    try:
-                        title, answers = self.scrape_question(question_url)
-                    except Exception as exc:
-                        print(f"[HIBA] Nem sikerült feldolgozni: {question_url} -> {exc}")
-                        continue
-
-                    f.write("Post:\n")
-                    f.write(f"{title}\n")
-                    for author, text in answers:
-                        f.write(f"Comment by {author}:\n")
-                        f.write(f"{text}\n")
-                    f.write("\n" + "-" * 80 + "\n\n")
-                    f.flush()
+    except PlaywrightTimeoutError:
+        print(f"[HIBA] Időtúllépés: {url}")
+    except Exception as e:
+        print(f"[HIBA] Nem sikerült beolvasni: {url} | Hiba: {e}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "GyakoriKerdesek Állatok kategória scraper. "
-            "Letölti a megadott oldalintervallum kérdéseit és a hozzászólásokat."
-        )
-    )
-    parser.add_argument("startpage", type=int, help="Kezdő oldal száma, pl. 1")
-    parser.add_argument("endpage", type=int, help="Záró oldal száma, pl. 3")
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=1.0,
-        help="Várakozás másodpercben a kérések között (alapértelmezett: 1.0)",
-    )
-    parser.add_argument(
-        "--output",
-        default=OUTPUT_FILE,
-        help=f"Kimeneti fájl neve (alapértelmezett: {OUTPUT_FILE})",
-    )
-
+async def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("startpage", type=int, help="Kezdő oldal száma")
+    parser.add_argument("endpage", type=int, help="Befejező oldal száma")
+    parser.add_argument("--headless", action="store_true", help="Headless mód")
     args = parser.parse_args()
 
-    if args.startpage < 1 or args.endpage < 1:
-        raise SystemExit("A startpage és endpage legalább 1 legyen.")
-    if args.startpage > args.endpage:
-        raise SystemExit("A startpage nem lehet nagyobb, mint az endpage.")
+    if args.startpage < 1:
+        parser.error("A startpage legalább 1 legyen.")
+    if args.endpage < args.startpage:
+        parser.error("Az endpage nem lehet kisebb, mint a startpage.")
 
-    scraper = Scraper(args.startpage, args.endpage, delay=args.delay)
-    scraper.save_posts(Path(args.output))
-    print(f"[KÉSZ] Mentve ide: {args.output}")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=args.headless)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            )
+        )
+        page = await context.new_page()
+
+        with open("allatok.txt", "w", encoding="utf-8") as f:
+            for page_num in range(args.startpage, args.endpage + 1):
+                list_url = build_list_url(page_num)
+                print(f"\n[INFO] === {page_num}. OLDAL BETÖLTÉSE: {list_url} ===\n")
+
+                try:
+                    await page.goto(list_url, wait_until="domcontentloaded", timeout=60000)
+                    await human_sleep(1.5, 2.5)
+
+                    question_urls = await collect_question_urls(page)
+                    print(f"[INFO] Talált kérdések: {len(question_urls)}")
+
+                    if not question_urls:
+                        continue
+
+                    for idx, q_url in enumerate(question_urls, start=1):
+                        print(f"[INFO] {idx}/{len(question_urls)} kérdés feldolgozása")
+                        await scrape_question(page, q_url, f)
+
+                        # Visszalépés helyett újratöltjük a listaoldalt.
+                        # Ez stabilabb, mint a history.back().
+                        await page.goto(list_url, wait_until="domcontentloaded", timeout=60000)
+                        await human_sleep(0.8, 1.6)
+
+                except PlaywrightTimeoutError:
+                    print(f"[HIBA] Időtúllépés a listaoldalon: {list_url}")
+                except Exception as e:
+                    print(f"[HIBA] Nem sikerült feldolgozni az oldalt: {list_url} | Hiba: {e}")
+
+        await browser.close()
+        print("\n[KÉSZ] A kért oldalak feldolgozva.")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
