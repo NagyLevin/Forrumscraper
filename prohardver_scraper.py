@@ -2,6 +2,8 @@ import argparse
 import re
 import sys
 import time
+import unicodedata
+from datetime import datetime
 from pathlib import Path
 from typing import List, Set, Tuple
 from urllib.parse import urljoin
@@ -33,6 +35,31 @@ def clean_text(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def sanitize_filename(name: str, max_len: int = 140) -> str:
+    name = clean_text(name)
+    if not name:
+        return "ismeretlen_topic"
+
+    name = unicodedata.normalize("NFKD", name)
+    name = "".join(ch for ch in name if not unicodedata.combining(ch))
+    name = name.replace("/", "-")
+    name = name.replace("\\", "-")
+    name = name.replace(":", " -")
+    name = name.replace("*", "")
+    name = name.replace("?", "")
+    name = name.replace('"', "")
+    name = name.replace("<", "(")
+    name = name.replace(">", ")")
+    name = name.replace("|", "-")
+    name = re.sub(r"\s+", " ", name).strip()
+    name = re.sub(r"[. ]+$", "", name)
+
+    if len(name) > max_len:
+        name = name[:max_len].rstrip(" .")
+
+    return name or "ismeretlen_topic"
 
 
 def setup_driver(headless: bool = False) -> webdriver.Chrome:
@@ -378,24 +405,65 @@ def scrape_topic_sequentially(driver: webdriver.Chrome, topic_title: str, topic_
     return resolved_title, all_comments
 
 
-def write_topic(output_path: Path, title: str, comments: List[Tuple[str, str, str]]) -> None:
-    with output_path.open("a", encoding="utf-8") as f:
-        f.write("Topic:\n")
-        f.write(f"{title}\n")
+def ensure_output_dirs(base_output: Path) -> Tuple[Path, Path, Path]:
+    prohardver_dir = base_output / "prohardver"
+    notebooks_dir = prohardver_dir / "notebooks"
+    visited_file = prohardver_dir / "visited_notebook.txt"
 
-        for _, author, comment in comments:
-            f.write("Comment:\n")
-            f.write(f"{author}: {comment}\n\n")
+    prohardver_dir.mkdir(parents=True, exist_ok=True)
+    notebooks_dir.mkdir(parents=True, exist_ok=True)
+    if not visited_file.exists():
+        visited_file.write_text("", encoding="utf-8")
 
-        f.write("=" * 80 + "\n\n")
+    return prohardver_dir, notebooks_dir, visited_file
 
 
-def scrape_offsets(start_offset: int, end_offset: int, output_file: str, delay: float, headless: bool) -> None:
-    output_path = Path(output_file)
-    output_path.write_text("", encoding="utf-8")
+def load_visited(visited_file: Path) -> Set[str]:
+    if not visited_file.exists():
+        return set()
+
+    visited = set()
+    for line in visited_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            visited.add(line)
+    return visited
+
+
+def append_visited(visited_file: Path, topic_url: str) -> None:
+    with visited_file.open("a", encoding="utf-8") as f:
+        f.write(topic_url.strip() + "\n")
+
+
+def write_topic_file(notebooks_dir: Path, title: str, topic_url: str, comments: List[Tuple[str, str, str]]) -> Path:
+    safe_name = sanitize_filename(title)
+    topic_file = notebooks_dir / f"{safe_name}.txt"
+    now_str = datetime.now().strftime("%Y.%m.%d")
+
+    content_lines = [
+        f"--visited--{now_str}",
+        "Topic:",
+        title,
+        "URL:",
+        topic_url,
+        "",
+    ]
+
+    for _, author, comment in comments:
+        content_lines.append("Comment:")
+        content_lines.append(f"{author}: {comment}")
+        content_lines.append("")
+
+    topic_file.write_text("\n".join(content_lines).rstrip() + "\n", encoding="utf-8")
+    return topic_file
+
+
+def scrape_offsets(start_offset: int, end_offset: int, output_dir: str, delay: float, headless: bool) -> None:
+    base_output = Path(output_dir).expanduser().resolve()
+    _, notebooks_dir, visited_file = ensure_output_dirs(base_output)
 
     driver = setup_driver(headless=headless)
-    processed_topics: Set[str] = set()
+    visited_topics = load_visited(visited_file)
     first_list_page = True
 
     try:
@@ -421,19 +489,21 @@ def scrape_offsets(start_offset: int, end_offset: int, output_file: str, delay: 
                 continue
 
             for idx, (topic_title, topic_url) in enumerate(topics, start=1):
-                if topic_url in processed_topics:
+                if topic_url in visited_topics:
+                    print(f"[INFO] ({idx}/{len(topics)}) Már feldolgozva, kihagyva: {topic_title}")
                     continue
 
-                processed_topics.add(topic_url)
                 print(f"\n[INFO] ({idx}/{len(topics)}) Topic: {topic_title}")
 
                 try:
                     resolved_title, comments = scrape_topic_sequentially(
                         driver, topic_title, topic_url, delay
                     )
+                    topic_file = write_topic_file(notebooks_dir, resolved_title, topic_url, comments)
+                    append_visited(visited_file, topic_url)
+                    visited_topics.add(topic_url)
                     print(f"[INFO] Összes mentett komment: {len(comments)}")
-                    write_topic(output_path, resolved_title, comments)
-                    print(f"[INFO] Topic elmentve: {resolved_title}")
+                    print(f"[INFO] Topic elmentve: {topic_file}")
                 except TimeoutException:
                     print(f"[WARN] Timeout a topicnál: {topic_url}")
                 except WebDriverException as e:
@@ -458,7 +528,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PROHARDVER notebook topic scraper Seleniummal.")
     parser.add_argument("start_offset", type=int, help="Kezdő offset. Pl. 0 vagy 100")
     parser.add_argument("end_offset", type=int, help="Vég offset. Pl. 200 vagy 300")
-    parser.add_argument("--output", default="notebooks.txt", help="Kimeneti fájl neve.")
+    parser.add_argument(
+        "--output",
+        default=".",
+        help="Kimeneti alapmappa. Ide jön létre a prohardver mappa. Alapértelmezett: aktuális mappa.",
+    )
     parser.add_argument("--delay", type=float, default=1.2, help="Várakozás oldalak között másodpercben.")
     parser.add_argument("--headless", action="store_true", help="Headless mód.")
     return parser.parse_args()
@@ -482,7 +556,7 @@ def main() -> None:
     scrape_offsets(
         start_offset=args.start_offset,
         end_offset=args.end_offset,
-        output_file=args.output,
+        output_dir=args.output,
         delay=args.delay,
         headless=args.headless,
     )
