@@ -26,7 +26,8 @@ HSZ_URL_RE = re.compile(
     r"^(?P<prefix>https?://[^#]+?/hsz_)(?P<start>\d+)-(?P<end>\d+)(?P<suffix>\.html)(?:#msg(?P<msg>\d+))?$",
     re.IGNORECASE,
 )
-PAGE_MARKER_RE = re.compile(r"^--page--(\d+)-(\d+)\s*$", re.MULTILINE)
+
+RANGE_ONLY_RE = re.compile(r"^(\d+)-(\d+)$")
 
 
 def build_list_url(offset: int) -> str:
@@ -50,6 +51,7 @@ def sanitize_filename(name: str, max_len: int = 140) -> str:
 
     name = unicodedata.normalize("NFKD", name)
     name = "".join(ch for ch in name if not unicodedata.combining(ch))
+
     for src, dst in [
         ("/", "-"),
         ("\\", "-"),
@@ -81,6 +83,7 @@ def setup_driver(headless: bool = False) -> webdriver.Chrome:
     options.add_argument("--no-sandbox")
     options.add_argument("--lang=hu-HU")
     options.add_argument("--start-maximized")
+
     driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(60)
     return driver
@@ -200,12 +203,16 @@ def parse_topic_links(html: str, page_url: str) -> List[Tuple[str, str]]:
         href = a.get("href")
         if not href:
             continue
+
         full_url = urljoin(page_url, href)
         if "/tema/" not in full_url or "/temak/" in full_url:
             continue
 
         title = clean_text(a.get_text(" ", strip=True))
-        if not title or full_url in seen:
+        if not title:
+            continue
+
+        if full_url in seen:
             continue
 
         seen.add(full_url)
@@ -220,19 +227,36 @@ def wait_for_messages(driver: webdriver.Chrome, timeout: int = 20) -> None:
     )
 
 
+def page_has_messages(driver: webdriver.Chrome) -> bool:
+    try:
+        items = driver.find_elements(By.CSS_SELECTOR, "li.media[data-id]")
+        return len(items) > 0
+    except Exception:
+        return False
+
+
+def is_404_page(driver: webdriver.Chrome) -> bool:
+    title = clean_text(driver.title).lower()
+    body_text = clean_text(driver.find_element(By.TAG_NAME, "body").text).lower()
+    return "404" in title or "404 not found" in body_text or "a kért oldal nem létezik" in body_text
+
+
 def extract_topic_title(driver: webdriver.Chrome, fallback: str) -> str:
     soup = BeautifulSoup(driver.page_source, "html.parser")
     for selector in ["meta[property='og:title']", "title", "h1"]:
         node = soup.select_one(selector)
         if not node:
             continue
+
         if selector.startswith("meta"):
             text = clean_text(node.get("content", ""))
         else:
             text = clean_text(node.get_text(" ", strip=True))
+
         text = re.sub(r"\s*-\s*PROHARDVER!.*$", "", text, flags=re.I)
         if text:
             return text
+
     return fallback
 
 
@@ -262,16 +286,19 @@ def extract_comment_text(post) -> str:
         nodes = post.select(selector)
         if not nodes:
             continue
+
         parts = []
         for node in nodes:
             text = clean_text(node.get_text("\n", strip=True))
             if text:
                 parts.append(text)
+
         if parts:
             joined = "\n".join(parts)
             joined = re.sub(r"\n{3,}", "\n\n", joined).strip()
             if joined:
                 return joined
+
     return ""
 
 
@@ -311,12 +338,14 @@ def get_next_page_element(driver: webdriver.Chrome):
             elements = driver.find_elements(By.XPATH, xpath)
         except Exception:
             elements = []
+
         for el in elements:
             try:
                 if el.is_displayed() and el.is_enabled():
                     return el
             except StaleElementReferenceException:
                 continue
+
     return None
 
 
@@ -331,24 +360,51 @@ def build_hsz_url_with_range(current_url: str, start: int, end: int) -> Optional
     m = HSZ_URL_RE.match(current_url)
     if not m:
         return None
+
     prefix = m.group("prefix")
     suffix = m.group("suffix")
     return f"{prefix}{start}-{end}{suffix}#msg{end + 1}"
+
+
+def normalize_topic_base_url(topic_url: str) -> str:
+    base = topic_url.split("#")[0].rstrip("/")
+    base = re.sub(r"/friss\.html$", "", base, flags=re.I)
+    base = re.sub(r"/hsz_\d+-\d+\.html$", "", base, flags=re.I)
+    return base
+
+
+def build_fresh_url_from_topic_url(topic_url: str) -> str:
+    return f"{normalize_topic_base_url(topic_url)}/friss.html"
+
+
+def build_hsz_url_from_topic_url(topic_url: str, start: int, end: int) -> str:
+    base = normalize_topic_base_url(topic_url)
+    return f"{base}/hsz_{start}-{end}.html#msg{end + 1}"
+
+
+def build_prev_range_from_saved(saved_start: int, saved_end: int) -> Optional[Tuple[int, int]]:
+    new_start = saved_start - 100
+    new_end = saved_end - 100
+    if new_start < 1 or new_end < 1:
+        return None
+    return new_start, new_end
 
 
 def build_fallback_next_hsz_url(current_url: str) -> Optional[str]:
     parsed = parse_hsz_range_from_url(current_url)
     if not parsed:
         return None
+
     start, end = parsed
     new_start = start - 100
     new_end = end - 100
     if new_start < 1 or new_end < 1:
         return None
+
     return build_hsz_url_with_range(current_url, new_start, new_end)
 
 
-def try_go_to_next_page(driver: webdriver.Chrome, delay: float) -> bool:
+def try_go_to_next_page(driver: webdriver.Chrome, delay: float) -> Optional[bool]:
     old_url = driver.current_url
 
     next_el = get_next_page_element(driver)
@@ -357,18 +413,21 @@ def try_go_to_next_page(driver: webdriver.Chrome, delay: float) -> bool:
             next_href = next_el.get_attribute("href")
         except Exception:
             next_href = None
+
         print(f"[DEBUG] Következő oldal gomb megvan. href={next_href}")
 
         if safe_click(driver, next_el):
             try:
                 WebDriverWait(driver, 20).until(lambda d: d.current_url != old_url)
                 wait_ready(driver)
+                time.sleep(3)
                 dismiss_known_popups(driver, first_page=False)
                 wait_for_messages(driver)
                 time.sleep(delay)
                 return True
             except TimeoutException:
                 print("[DEBUG] Következő oldal gomb volt, de timeout lett az átmenetnél.")
+                return None
         else:
             print("[DEBUG] Megvolt a következő oldal gomb, de a kattintás nem sikerült.")
 
@@ -384,10 +443,15 @@ def try_go_to_next_page(driver: webdriver.Chrome, delay: float) -> bool:
         dismiss_known_popups(driver, first_page=False)
         wait_for_messages(driver)
         time.sleep(delay)
-        return driver.current_url != old_url
+        if driver.current_url != old_url:
+            return True
+        return False
+    except TimeoutException:
+        print("[DEBUG] URL fallback timeout.")
+        return None
     except Exception as e:
         print(f"[DEBUG] URL fallback hiba: {e}")
-        return False
+        return None
 
 
 def ensure_output_dirs(base_output: Path) -> Tuple[Path, Path, Path]:
@@ -397,6 +461,7 @@ def ensure_output_dirs(base_output: Path) -> Tuple[Path, Path, Path]:
 
     prohardver_dir.mkdir(parents=True, exist_ok=True)
     notebooks_dir.mkdir(parents=True, exist_ok=True)
+
     if not visited_file.exists():
         visited_file.write_text("", encoding="utf-8")
 
@@ -406,7 +471,12 @@ def ensure_output_dirs(base_output: Path) -> Tuple[Path, Path, Path]:
 def load_visited(visited_file: Path) -> Set[str]:
     if not visited_file.exists():
         return set()
-    return {line.strip() for line in visited_file.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+    return {
+        line.strip()
+        for line in visited_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
 
 
 def append_visited(visited_file: Path, topic_url: str) -> None:
@@ -418,25 +488,9 @@ def topic_file_path(notebooks_dir: Path, title: str) -> Path:
     return notebooks_dir / f"{sanitize_filename(title)}.txt"
 
 
-def read_topic_progress_marker(topic_file: Path) -> Optional[Tuple[int, int]]:
-    if not topic_file.exists():
-        return None
-    text = topic_file.read_text(encoding="utf-8")
-    matches = PAGE_MARKER_RE.findall(text)
-    if not matches:
-        return None
-    start, end = matches[-1]
-    return int(start), int(end)
-
-
-def strip_progress_markers(text: str) -> str:
-    text = PAGE_MARKER_RE.sub("", text)
-    text = re.sub(r"\n{3,}", "\n\n", text).rstrip()
-    return text
-
-
 def ensure_topic_metadata(topic_file: Path, title: str, topic_url: str) -> None:
     now_str = datetime.now().strftime("%Y.%m.%d")
+
     if not topic_file.exists():
         topic_file.write_text(
             f"--visited--{now_str}\nTopic:\n{title}\nURL:\n{topic_url}\n\n",
@@ -445,50 +499,103 @@ def ensure_topic_metadata(topic_file: Path, title: str, topic_url: str) -> None:
         return
 
     text = topic_file.read_text(encoding="utf-8")
-    stripped = text.lstrip()
-    if stripped.startswith("--visited--"):
-        lines = text.splitlines()
-        if lines:
-            lines[0] = f"--visited--{now_str}"
-        topic_file.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    if not text.strip():
+        topic_file.write_text(
+            f"--visited--{now_str}\nTopic:\n{title}\nURL:\n{topic_url}\n\n",
+            encoding="utf-8",
+        )
         return
 
-    topic_file.write_text(
-        f"--visited--{now_str}\nTopic:\n{title}\nURL:\n{topic_url}\n\n{text}",
-        encoding="utf-8",
-    )
+    lines = text.splitlines()
+    if lines and lines[0].startswith("--visited--"):
+        lines[0] = f"--visited--{now_str}"
+        topic_file.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    else:
+        topic_file.write_text(
+            f"--visited--{now_str}\nTopic:\n{title}\nURL:\n{topic_url}\n\n{text}",
+            encoding="utf-8",
+        )
 
 
-def append_page_to_topic_file(topic_file: Path, page_range: Tuple[int, int], comments: List[Tuple[str, str, str]]) -> None:
-    text = topic_file.read_text(encoding="utf-8") if topic_file.exists() else ""
-    text = strip_progress_markers(text)
+def get_last_nonempty_line(topic_file: Path) -> Optional[str]:
+    if not topic_file.exists():
+        return None
 
-    start, end = page_range
+    lines = topic_file.read_text(encoding="utf-8").splitlines()
+    for line in reversed(lines):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+
+    return None
+
+
+def read_resume_range_from_last_line(topic_file: Path) -> Optional[Tuple[int, int]]:
+    last_line = get_last_nonempty_line(topic_file)
+    if not last_line:
+        return None
+
+    m = RANGE_ONLY_RE.match(last_line)
+    if not m:
+        return None
+
+    return int(m.group(1)), int(m.group(2))
+
+
+def remove_trailing_range_line(topic_file: Path) -> None:
+    if not topic_file.exists():
+        return
+
+    lines = topic_file.read_text(encoding="utf-8").splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    if lines and RANGE_ONLY_RE.match(lines[-1].strip()):
+        lines.pop()
+
+    text = "\n".join(lines).rstrip()
+    if text:
+        text += "\n"
+    topic_file.write_text(text, encoding="utf-8")
+
+
+def append_page_and_range(
+    topic_file: Path,
+    page_range: Tuple[int, int],
+    comments: List[Tuple[str, str, str]],
+) -> None:
+    remove_trailing_range_line(topic_file)
+
+    existing = topic_file.read_text(encoding="utf-8") if topic_file.exists() else ""
+    existing = existing.rstrip()
+
     block_lines = []
     for _, author, comment in comments:
         block_lines.append("Comment:")
         block_lines.append(f"{author}: {comment}")
         block_lines.append("")
 
-    if text:
-        text = text.rstrip() + "\n\n"
+    start, end = page_range
 
+    parts = []
+    if existing:
+        parts.append(existing)
     if block_lines:
-        text += "\n".join(block_lines).rstrip()
-        if not text.endswith("\n"):
-            text += "\n"
+        parts.append("\n".join(block_lines).rstrip())
+    parts.append(f"{start}-{end}")
 
-    text += f"\n--page--{start}-{end}\n"
-    topic_file.write_text(text, encoding="utf-8")
+    new_text = "\n\n".join(part for part in parts if part).rstrip() + "\n"
+    topic_file.write_text(new_text, encoding="utf-8")
 
 
 def finalize_topic_file(topic_file: Path, title: str, topic_url: str) -> None:
     if not topic_file.exists():
         return
 
+    remove_trailing_range_line(topic_file)
+
     now_str = datetime.now().strftime("%Y.%m.%d")
     text = topic_file.read_text(encoding="utf-8")
-    text = strip_progress_markers(text)
     lines = text.splitlines()
 
     if lines:
@@ -502,19 +609,45 @@ def finalize_topic_file(topic_file: Path, title: str, topic_url: str) -> None:
     topic_file.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def resolve_resume_url(default_topic_url: str, topic_file: Path) -> str:
-    last_range = read_topic_progress_marker(topic_file)
-    if not last_range:
-        return default_topic_url
+def resolve_resume_url(topic_url: str, topic_file: Path) -> str:
+    resume_range = read_resume_range_from_last_line(topic_file)
+    if not resume_range:
+        return build_fresh_url_from_topic_url(topic_url)
 
-    start, end = last_range
-    next_start = start - 100
-    next_end = end - 100
-    if next_start < 1 or next_end < 1:
-        return default_topic_url
+    saved_start, saved_end = resume_range
+    print(f"[DEBUG] Resume range megtalálva a fájl végén: {saved_start}-{saved_end}")
 
-    resumed = build_hsz_url_with_range(default_topic_url, next_start, next_end)
-    return resumed or default_topic_url
+    prev_range = build_prev_range_from_saved(saved_start, saved_end)
+    if not prev_range:
+        print("[DEBUG] A mentett range-ből már nem lehet 100-zal visszalépni, indul a friss.html oldalról.")
+        return build_fresh_url_from_topic_url(topic_url)
+
+    new_start, new_end = prev_range
+    fixed_url = build_hsz_url_from_topic_url(topic_url, new_start, new_end)
+    print(f"[DEBUG] Resume URL (100-zal visszaléptetve): {fixed_url}")
+    return fixed_url
+
+
+def open_topic_start_page(driver: webdriver.Chrome, topic_url: str, topic_file: Path, delay: float) -> str:
+    start_url = resolve_resume_url(topic_url, topic_file)
+    fresh_url = build_fresh_url_from_topic_url(topic_url)
+
+    print(f"[DEBUG] Topic megnyitása: {start_url}")
+    driver.get(start_url)
+    wait_ready(driver)
+    dismiss_known_popups(driver, first_page=False)
+    time.sleep(delay)
+
+    if is_404_page(driver) or not page_has_messages(driver):
+        if start_url != fresh_url:
+            print(f"[DEBUG] A resume URL nem adott használható kommentoldalt, fallback friss.html-re: {fresh_url}")
+            driver.get(fresh_url)
+            wait_ready(driver)
+            dismiss_known_popups(driver, first_page=False)
+            time.sleep(delay)
+
+    wait_for_messages(driver)
+    return driver.current_url
 
 
 def scrape_topic_sequentially(
@@ -524,22 +657,11 @@ def scrape_topic_sequentially(
     topic_file: Path,
     delay: float,
 ) -> Tuple[str, bool]:
-    start_url = resolve_resume_url(topic_url, topic_file)
-    print(f"[DEBUG] Topic megnyitása: {start_url}")
-
-    driver.get(start_url)
-    wait_ready(driver)
-    dismiss_known_popups(driver, first_page=False)
-    wait_for_messages(driver)
-    time.sleep(delay)
+    opened_url = open_topic_start_page(driver, topic_url, topic_file, delay)
+    print(f"[DEBUG] Ténylegesen megnyitott kezdőoldal: {opened_url}")
 
     resolved_title = extract_topic_title(driver, topic_title)
     ensure_topic_metadata(topic_file, resolved_title, topic_url)
-
-    seen_ranges: Set[Tuple[int, int]] = set()
-    last_saved_marker = read_topic_progress_marker(topic_file)
-    if last_saved_marker:
-        seen_ranges.add(last_saved_marker)
 
     visited_urls: Set[str] = set()
     page_index = 1
@@ -548,8 +670,7 @@ def scrape_topic_sequentially(
         current_url = driver.current_url
         if current_url in visited_urls:
             print(f"[DEBUG] Már feldolgozott oldal, leállás: {current_url}")
-            finalize_topic_file(topic_file, resolved_title, topic_url)
-            return resolved_title, True
+            return resolved_title, False
 
         visited_urls.add(current_url)
         current_range = parse_hsz_range_from_url(current_url)
@@ -558,22 +679,25 @@ def scrape_topic_sequentially(
         page_comments = parse_comments_from_html(driver.page_source)
 
         if current_range:
-            if current_range in seen_ranges:
-                print(f"[DEBUG] Ez a range már mentve volt: {current_range[0]}-{current_range[1]}")
-            else:
-                append_page_to_topic_file(topic_file, current_range, page_comments)
-                seen_ranges = {current_range}
-                print(f"[DEBUG] Oldal elmentve és marker frissítve: --page--{current_range[0]}-{current_range[1]}")
+            append_page_and_range(topic_file, current_range, page_comments)
+            print(f"[DEBUG] Oldal mentve, új utolsó sor: {current_range[0]}-{current_range[1]}")
         else:
-            print("[DEBUG] Nem sikerült range-et kiolvasni az URL-ből, ezért ezt az oldalt nem tudom resume-markerrel menteni.")
+            print("[DEBUG] Ez a friss.html oldal, itt nincs számozott range, ezért ide nem kerül range sor.")
 
         moved = try_go_to_next_page(driver, delay)
-        if not moved:
-            print("[DEBUG] Nincs több oldal, marker törlése és topic véglegesítése.")
+
+        if moved is True:
+            page_index += 1
+            continue
+
+        if moved is False:
+            print("[DEBUG] Nincs több oldal, utolsó range törlése és topic véglegesítése.")
             finalize_topic_file(topic_file, resolved_title, topic_url)
             return resolved_title, True
 
-        page_index += 1
+        if moved is None:
+            print("[DEBUG] Timeout vagy navigációs hiba történt, a topic NEM kerül a visitedbe.")
+            return resolved_title, False
 
 
 def scrape_offsets(start_offset: int, end_offset: int, output_dir: str, delay: float, headless: bool) -> None:
@@ -629,9 +753,9 @@ def scrape_offsets(start_offset: int, end_offset: int, output_dir: str, delay: f
                     if finished:
                         append_visited(visited_file, topic_url)
                         visited_topics.add(topic_url)
-                        print(f"[INFO] Topic teljesen feldolgozva: {resolved_title}")
+                        print(f"[INFO] Topic teljesen feldolgozva, visitedbe írva: {resolved_title}")
                     else:
-                        print(f"[INFO] Topic félbemaradt, később innen folytatható: {resolved_title}")
+                        print(f"[INFO] Topic nincs kész vagy hibával megállt, NEM kerül visitedbe: {resolved_title}")
 
                 except TimeoutException:
                     print(f"[WARN] Timeout a topicnál: {topic_url}")
