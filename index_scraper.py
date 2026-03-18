@@ -5,12 +5,11 @@ import argparse
 import json
 import re
 import sys
-import time
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -74,8 +73,8 @@ def ensure_dirs(base_output: Path) -> Path:
     return index_dir
 
 
-def ensure_visited_file(folder: Path) -> Path:
-    visited = folder / "visited_topics.txt"
+def ensure_root_visited_file(index_dir: Path) -> Path:
+    visited = index_dir / "visited_topics.txt"
     if not visited.exists():
         visited.write_text("", encoding="utf-8")
     return visited
@@ -266,7 +265,6 @@ def parse_main_categories(html: str, page_url: str) -> List[Dict]:
                 continue
 
             full_url = urljoin(page_url, href)
-
             if not SHOW_TOPIC_LIST_RE.search(full_url):
                 continue
 
@@ -283,9 +281,7 @@ def parse_main_categories(html: str, page_url: str) -> List[Dict]:
 
         body_text = clean_text(body_p.get_text(" ", strip=True)) if body_p else ""
 
-        print(
-            f"[DEBUG] Fórumcsoport #{idx}: {category_title} | kis linkek: {len(sublinks)}"
-        )
+        print(f"[DEBUG] Fórumcsoport #{idx}: {category_title} | kis linkek: {len(sublinks)}")
 
         if sublinks:
             results.append(
@@ -558,7 +554,6 @@ def extract_comment_from_table(table: Tag, topic_page_url: str) -> Optional[Dict
             seen.add(item)
 
     body = "\n\n".join(uniq).strip()
-
     if not body:
         return None
 
@@ -651,45 +646,10 @@ def topic_file_path(subforum_dir: Path, topic_title: str) -> Path:
     return subforum_dir / f"{sanitize_filename(topic_title)}.txt"
 
 
-def scrape_topic(
-    fetcher: BrowserFetcher,
-    topic_title: str,
-    topic_url: str,
-    delay: float,
-) -> Dict:
-    print(f"[INFO] Topic megnyitása: {topic_title}")
-    current_url, html = fetcher.fetch(topic_url, wait_ms=int(delay * 1000))
-
-    resolved_title = extract_topic_title(html, topic_title)
-    topic_meta = extract_topic_meta(html, current_url)
-
-    all_comments: List[Dict] = []
-    seen_comment_keys: Set[str] = set()
-    page_no = 1
-
-    while True:
-        print(f"[INFO] Kommentoldal #{page_no}: {current_url}")
-        page_comments = parse_comments_from_topic_page(html, current_url)
-
-        for item in page_comments:
-            key = f"{item.get('comment_id') or ''}::{item.get('author') or ''}::{item.get('data')[:80]}"
-            if key in seen_comment_keys:
-                continue
-            seen_comment_keys.add(key)
-            all_comments.append(item)
-
-        next_url = get_topic_next_page_url(html, current_url)
-        if not next_url or next_url == current_url:
-            print("[INFO] Nincs több kommentoldal ennél a topicnál.")
-            break
-
-        print(f"[INFO] Következő kommentoldal: {next_url}")
-        current_url, html = fetcher.fetch(next_url, wait_ms=int(delay * 1000))
-        page_no += 1
-
+def build_topic_payload_base(resolved_title: str, topic_meta: Dict) -> Dict:
     opener = topic_meta.get("opener") or ""
 
-    payload = {
+    return {
         "title": resolved_title,
         "authors": [split_name_like_person(opener)] if opener else [],
         "data": {
@@ -710,25 +670,94 @@ def scrape_topic(
             },
             "origin": "index_forum",
         },
-        "comments": [
-            {
-                "authors": [split_name_like_person(c["author"])] if c.get("author") else [],
-                "data": c["data"],
-                "likes": c.get("likes"),
-                "dislikes": c.get("dislikes"),
-                "score": c.get("score"),
-                "date": c.get("date"),
-                "url": c.get("url"),
-                "language": "hu",
-                "tags": [],
-                "extra": {
-                    "comment_id": c.get("comment_id"),
-                },
-            }
-            for c in all_comments
-        ],
+        "comments": [],
         "origin": "index_forum",
+        "extra": {
+            "scrape_status": "in_progress",
+            "saved_comment_pages": 0,
+        },
     }
+
+
+def append_comments_to_payload(payload: Dict, new_comments: List[Dict]) -> None:
+    existing_keys = set()
+    for c in payload.get("comments", []):
+        extra = c.get("extra", {})
+        key = f"{extra.get('comment_id') or ''}::{(c.get('authors') or [{}])[0].get('name', '') if c.get('authors') else ''}::{c.get('data', '')[:80]}"
+        existing_keys.add(key)
+
+    for c in new_comments:
+        author_name = c.get("author") or "ismeretlen"
+        item = {
+            "authors": [split_name_like_person(author_name)] if author_name else [],
+            "data": c["data"],
+            "likes": c.get("likes"),
+            "dislikes": c.get("dislikes"),
+            "score": c.get("score"),
+            "date": c.get("date"),
+            "url": c.get("url"),
+            "language": "hu",
+            "tags": [],
+            "extra": {
+                "comment_id": c.get("comment_id"),
+            },
+        }
+
+        key = f"{c.get('comment_id') or ''}::{author_name}::{c.get('data', '')[:80]}"
+        if key in existing_keys:
+            continue
+
+        payload["comments"].append(item)
+        existing_keys.add(key)
+
+
+def mark_payload_finished(payload: Dict) -> None:
+    payload["data"]["date_modified"] = now_iso()
+    payload["extra"]["scrape_status"] = "finished"
+
+
+def scrape_topic(
+    fetcher: BrowserFetcher,
+    topic_title: str,
+    topic_url: str,
+    topic_file: Path,
+    delay: float,
+) -> Dict:
+    print(f"[INFO] Topic megnyitása: {topic_title}")
+    current_url, html = fetcher.fetch(topic_url, wait_ms=int(delay * 1000))
+
+    resolved_title = extract_topic_title(html, topic_title)
+    topic_meta = extract_topic_meta(html, current_url)
+    payload = build_topic_payload_base(resolved_title, topic_meta)
+
+    page_no = 1
+
+    while True:
+        print(f"[INFO] Kommentoldal #{page_no}: {current_url}")
+        page_comments = parse_comments_from_topic_page(html, current_url)
+
+        append_comments_to_payload(payload, page_comments)
+        payload["data"]["date_modified"] = now_iso()
+        payload["extra"]["saved_comment_pages"] = page_no
+
+        save_topic_json(topic_file, payload)
+        print(
+            f"[INFO] JSON oldalanként mentve: {topic_file} | "
+            f"összes komment eddig: {len(payload['comments'])}"
+        )
+
+        next_url = get_topic_next_page_url(html, current_url)
+        if not next_url or next_url == current_url:
+            print("[INFO] Nincs több kommentoldal ennél a topicnál.")
+            break
+
+        print(f"[INFO] Következő kommentoldal: {next_url}")
+        current_url, html = fetcher.fetch(next_url, wait_ms=int(delay * 1000))
+        page_no += 1
+
+    mark_payload_finished(payload)
+    save_topic_json(topic_file, payload)
+    print(f"[INFO] Topic véglegesítve: {topic_file}")
 
     return payload
 
@@ -739,14 +768,13 @@ def scrape_subforum(
     subforum_title: str,
     subforum_url: str,
     base_index_dir: Path,
+    visited_file: Path,
+    visited_topics: Set[str],
     delay: float,
 ) -> None:
     category_dir = base_index_dir / sanitize_filename(category_title)
     subforum_dir = category_dir / sanitize_filename(subforum_title)
     subforum_dir.mkdir(parents=True, exist_ok=True)
-
-    visited_file = ensure_visited_file(subforum_dir)
-    visited_topics = load_visited(visited_file)
 
     print(f"\n[INFO] Alforum indul: {category_title} -> {subforum_title}")
     print(f"[INFO] Alforum URL: {subforum_url}")
@@ -774,21 +802,31 @@ def scrape_subforum(
                 continue
 
             try:
+                initial_path = topic_file_path(subforum_dir, topic_title)
+
                 payload = scrape_topic(
                     fetcher=fetcher,
                     topic_title=topic_title,
                     topic_url=topic_url,
+                    topic_file=initial_path,
                     delay=delay,
                 )
 
                 resolved_title = payload.get("title") or topic_title
-                topic_path = topic_file_path(subforum_dir, resolved_title)
+                final_path = topic_file_path(subforum_dir, resolved_title)
 
-                save_topic_json(topic_path, payload)
+                if final_path != initial_path:
+                    if initial_path.exists():
+                        initial_path.replace(final_path)
+                    else:
+                        save_topic_json(final_path, payload)
+                else:
+                    save_topic_json(final_path, payload)
+
                 append_visited(visited_file, topic_url)
                 visited_topics.add(topic_url)
 
-                print(f"[INFO] Topic mentve: {topic_path}")
+                print(f"[INFO] Topic mentve: {final_path}")
                 print(f"[INFO] Topic visitedbe írva: {topic_url}")
 
             except Exception as e:
@@ -813,6 +851,8 @@ def scrape_main(
 ) -> None:
     base_output = Path(output_dir).expanduser().resolve()
     index_dir = ensure_dirs(base_output)
+    visited_file = ensure_root_visited_file(index_dir)
+    visited_topics = load_visited(visited_file)
 
     print(f"[INFO] Főoldal megnyitása: {MAIN_FORUM_URL}")
     final_url, html = fetcher.fetch(MAIN_FORUM_URL, wait_ms=int(delay * 1000))
@@ -851,6 +891,8 @@ def scrape_main(
                     subforum_title=subforum_title,
                     subforum_url=subforum_url,
                     base_index_dir=index_dir,
+                    visited_file=visited_file,
+                    visited_topics=visited_topics,
                     delay=delay,
                 )
             except Exception as e:
