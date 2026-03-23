@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Tag, NavigableString
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
@@ -25,6 +25,9 @@ MAIN_FORUM_URL = "https://www.hobbielektronika.hu/forum/"
 COMMENT_ID_RE = re.compile(r'"comment_id"\s*:\s*"([^"]+)"')
 COMMENT_URL_RE = re.compile(r'"url"\s*:\s*"([^"]+)"')
 TOPIC_LINK_HINT_RE = re.compile(r"/forum/", re.IGNORECASE)
+
+MONTH_RE = r"(?:Jan|Feb|Már|Mar|Apr|Ápr|Máj|May|Jún|Jun|Júl|Jul|Aug|Szept|Sep|Okt|Oct|Nov|Dec)"
+DATE_RE = re.compile(rf"\b{MONTH_RE}\s+\d{{1,2}},\s+\d{{4}}\b", re.IGNORECASE)
 
 
 # -----------------------------
@@ -312,9 +315,6 @@ def write_topic_stream_header(topic_file: Path, resolved_title: str, topic_meta:
     }
 
     header_json = json.dumps(header_obj, ensure_ascii=False, indent=2)
-    if not header_json.endswith("}"):
-        raise RuntimeError("Hibás header JSON generálás.")
-
     text = header_json[:-1] + ',\n  "comments": [\n'
     topic_file.write_text(text, encoding="utf-8")
 
@@ -455,10 +455,7 @@ def is_probable_topic_link(a: Tag) -> bool:
         "keresés",
         "fórum",
     }
-    if lower in blacklist:
-        return False
-
-    return True
+    return lower not in blacklist
 
 
 def parse_topic_rows_from_main_page(html: str, page_url: str) -> List[Dict]:
@@ -567,11 +564,7 @@ def get_main_next_page_url(html: str, current_url: str) -> Optional[str]:
 def extract_topic_title(html: str, fallback: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
-    selectors = [
-        "div#mainContent h1",
-        "title",
-    ]
-    for selector in selectors:
+    for selector in ["div#mainContent h1", "title"]:
         node = soup.select_one(selector)
         if node:
             text = clean_text(node.get_text(" ", strip=True))
@@ -585,15 +578,11 @@ def extract_topic_title(html: str, fallback: str) -> str:
 def extract_topic_meta(html: str, topic_url: str) -> Dict:
     current_human_page, total_pages = parse_topic_displayed_page_info(html, topic_url)
     soup = BeautifulSoup(html, "html.parser")
-
-    detected_total_comments = None
     all_boxes = find_comment_containers(soup)
-    if all_boxes:
-        detected_total_comments = len(all_boxes)
 
     return {
         "url": get_topic_base_url(topic_url),
-        "detected_total_comments": detected_total_comments,
+        "detected_total_comments": len(all_boxes) if all_boxes else None,
         "fetched_page": current_human_page,
         "fetched_total_pages": total_pages,
     }
@@ -648,10 +637,7 @@ def extract_rating_and_likes_from_box(box: Tag, comment_id: Optional[str]) -> Tu
         title = clean_text(node.get("title", ""))
         if title and "Értékelve eddig:" in title:
             m = re.search(r"Értékelve eddig:\s*(.+)$", title, flags=re.I)
-            if m:
-                rating = clean_text(m.group(1))
-            else:
-                rating = title
+            rating = clean_text(m.group(1)) if m else title
 
         if likes is not None or rating:
             return likes, rating
@@ -660,10 +646,21 @@ def extract_rating_and_likes_from_box(box: Tag, comment_id: Optional[str]) -> Tu
 
 
 def extract_header_node(box: Tag) -> Optional[Tag]:
-    for selector in ["div.boxhp", "div.boxh", "div.boxhead"]:
+    # JAVÍTVA: A hiba forrása a "div.boxhp" elírás volt "div.boxph" helyett.
+    for selector in ["div.boxph", "div.boxhp", "div.boxh", "div.boxhead"]:
         node = box.select_one(selector)
         if node:
             return node
+    return None
+
+
+def try_extract_date_from_text(text: str) -> Optional[str]:
+    text = clean_text(text)
+    if not text:
+        return None
+    m = DATE_RE.search(text)
+    if m:
+        return clean_text(m.group(0))
     return None
 
 
@@ -671,17 +668,32 @@ def extract_date_from_header(header_node: Optional[Tag]) -> Optional[str]:
     if not header_node:
         return None
 
-    for th in header_node.select("table.fptbl th"):
-        txt = clean_text(th.get_text(" ", strip=True))
-        if not txt:
-            continue
-        if re.match(r"^[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]{3,}\s+\d{1,2},\s+\d{4}$", txt):
-            return txt
+    # 1) direkt táblacellákból
+    for cell in header_node.select("table.fptbl th, table.fptbl td, th, td"):
+        txt = clean_text(cell.get_text(" ", strip=True))
+        found = try_extract_date_from_text(txt)
+        if found:
+            return found
 
+    # 2) nyers text node-okból
+    for node in header_node.descendants:
+        if isinstance(node, NavigableString):
+            txt = clean_text(str(node))
+            found = try_extract_date_from_text(txt)
+            if found:
+                return found
+
+    # 3) teljes fejléc plain text
     header_text = clean_text(header_node.get_text(" ", strip=True))
-    m = re.search(r"([A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]{3,}\s+\d{1,2},\s+\d{4})", header_text)
-    if m:
-        return clean_text(m.group(1))
+    found = try_extract_date_from_text(header_text)
+    if found:
+        return found
+
+    # 4) teljes fejléc HTML fallback
+    header_html = str(header_node)
+    found = try_extract_date_from_text(header_html)
+    if found:
+        return found
 
     return None
 
@@ -745,13 +757,9 @@ def extract_comment_from_container(container: Tag, topic_page_url: str) -> Optio
     modified_text = clean_text(boxpa.get_text(" ", strip=True)) if boxpa else ""
     modified_date = None
     if modified_text:
-        m_mod = re.search(
-            r"A hozzászólás módosítva:\s*([A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]{3,}\s+\d{1,2},\s+\d{4})",
-            modified_text,
-            flags=re.I,
-        )
+        m_mod = DATE_RE.search(modified_text)
         if m_mod:
-            modified_date = clean_text(m_mod.group(1))
+            modified_date = clean_text(m_mod.group(0))
 
     comment_url = strip_fragment(topic_page_url)
     if comment_id:
@@ -828,10 +836,7 @@ def topic_page_looks_closed_or_unavailable(html: str) -> bool:
         "a téma hozzászólásai áthelyezésre kerültek ide",
     ]
 
-    if any(sig in text for sig in signals) and not topic_has_any_comment_container(html):
-        return True
-
-    return False
+    return any(sig in text for sig in signals) and not topic_has_any_comment_container(html)
 
 
 def get_topic_prev_page_url(html: str, current_url: str) -> Optional[str]:
@@ -905,10 +910,7 @@ def comment_to_output_item(c: Dict) -> Dict:
 def parse_resume_page_from_comment_url(url: str) -> Optional[int]:
     if not url:
         return None
-    human = get_topic_human_page_from_url(url)
-    if human is not None:
-        return human
-    return None
+    return get_topic_human_page_from_url(url)
 
 
 def scrape_topic(
@@ -1171,39 +1173,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="hobbielektronika.hu fórum scraper Playwright + BeautifulSoup alapon, streamelt komment-append módban"
     )
-    parser.add_argument(
-        "--output",
-        default=".",
-        help="Kimeneti alapmappa. Ide jön létre a hobbielektronika/ mappa.",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=1.5,
-        help="Várakozás oldalak között másodpercben.",
-    )
-    parser.add_argument(
-        "--only-title",
-        default=None,
-        help="Csak azokat a topicokat dolgozza fel, amelyek címében ez szerepel.",
-    )
-    parser.add_argument(
-        "--start-page",
-        type=int,
-        default=1,
-        help="A fórum főoldali lapozásának kezdő oldala (1-alapú).",
-    )
-    parser.add_argument(
-        "--max-pages",
-        type=int,
-        default=None,
-        help="Legfeljebb ennyi főoldali listázóoldalt dolgoz fel.",
-    )
-    parser.add_argument(
-        "--headed",
-        action="store_true",
-        help="Látható böngészőablakkal fusson.",
-    )
+    parser.add_argument("--output", default=".", help="Kimeneti alapmappa.")
+    parser.add_argument("--delay", type=float, default=1.5, help="Várakozás oldalak között másodpercben.")
+    parser.add_argument("--only-title", default=None, help="Csak azokat a topicokat dolgozza fel, amelyek címében ez szerepel.")
+    parser.add_argument("--start-page", type=int, default=1, help="A fórum főoldali lapozásának kezdő oldala (1-alapú).")
+    parser.add_argument("--max-pages", type=int, default=None, help="Legfeljebb ennyi főoldali listázóoldalt dolgoz fel.")
+    parser.add_argument("--headed", action="store_true", help="Látható böngészőablakkal fusson.")
     return parser.parse_args()
 
 
@@ -1230,5 +1205,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-  
     # python hobbye_scraper.py --output ./hobbielektronika --headed
