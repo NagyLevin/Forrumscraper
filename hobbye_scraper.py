@@ -156,18 +156,10 @@ def get_topic_base_url(url: str) -> str:
 
 
 def get_main_page_index(url: str) -> int:
-    """
-    0-alapú pg indexet ad vissza.
-    Első oldal: 0
-    """
     pg = extract_query_param(url, "pg")
     if pg and pg.isdigit():
         return int(pg)
     return 0
-
-
-def get_main_human_page(url: str) -> int:
-    return get_main_page_index(url) + 1
 
 
 def get_topic_page_index_from_url(url: str) -> Optional[int]:
@@ -185,11 +177,6 @@ def get_topic_human_page_from_url(url: str) -> Optional[int]:
 
 
 def parse_topic_displayed_page_info(html: str, current_url: str) -> Tuple[int, Optional[int]]:
-    """
-    Visszaadja:
-      - jelenlegi oldal száma 1-alapon
-      - összes oldal száma, ha felismerhető
-    """
     soup = BeautifulSoup(html, "html.parser")
     page_text = clean_text(soup.get_text("\n", strip=True))
 
@@ -203,8 +190,6 @@ def parse_topic_displayed_page_info(html: str, current_url: str) -> Tuple[int, O
     if url_page is not None:
         return url_page, None
 
-    # Ha nincs pg param, a topic megnyitásakor jellemzően az utolsó oldal nyílik meg,
-    # de biztosabbat nem tudunk. Ilyenkor legalább 1-et adunk vissza.
     return 1, None
 
 
@@ -276,12 +261,6 @@ def count_existing_comments_in_stream_file(topic_file: Path) -> int:
 
 
 def get_last_written_comment_info(topic_file: Path) -> Tuple[Optional[str], Optional[str], int]:
-    """
-    Visszaadja:
-      - utolsó comment_id
-      - utolsó komment URL
-      - meglévő kommentek száma
-    """
     if not topic_file.exists():
         return None, None, 0
 
@@ -472,8 +451,9 @@ def is_probable_topic_link(a: Tag) -> bool:
         "belépés",
         "regisztráció",
         "elfelejtett jelszó",
-        "új téma nyitása",
+        "új kérdés a topikon belül",
         "keresés",
+        "fórum",
     }
     if lower in blacklist:
         return False
@@ -569,17 +549,14 @@ def get_main_next_page_url(html: str, current_url: str) -> Optional[str]:
         if pg and pg.isdigit():
             candidates.append((int(pg), full))
 
-    # Először a pontosan következő indexű oldalt keressük
     for idx, full in candidates:
         if idx == wanted_next_idx:
             return full
 
-    # Ha nincs, vegyük a legkisebb nagyobbat
     bigger = sorted((idx, full) for idx, full in candidates if idx > current_idx)
     if bigger:
         return bigger[0][1]
 
-    # Végső fallback
     return set_query_param(MAIN_FORUM_URL, "pg", str(wanted_next_idx))
 
 
@@ -591,7 +568,6 @@ def extract_topic_title(html: str, fallback: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
     selectors = [
-        "div#mainContent > table h1",
         "div#mainContent h1",
         "title",
     ]
@@ -603,19 +579,12 @@ def extract_topic_title(html: str, fallback: str) -> str:
                 text = re.sub(r"^\s*Fórum\s*»\s*", "", text, flags=re.I)
                 return text
 
-    # Gyakori, hogy a felső zöld fejléc tartalmazza a címet
-    for node in soup.select("td, div, span"):
-        txt = clean_text(node.get_text(" ", strip=True))
-        if txt and len(txt) >= 3 and txt == fallback:
-            return txt
-
     return fallback
 
 
 def extract_topic_meta(html: str, topic_url: str) -> Dict:
     current_human_page, total_pages = parse_topic_displayed_page_info(html, topic_url)
     soup = BeautifulSoup(html, "html.parser")
-    page_text = clean_text(soup.get_text("\n", strip=True))
 
     detected_total_comments = None
     all_boxes = find_comment_containers(soup)
@@ -627,22 +596,15 @@ def extract_topic_meta(html: str, topic_url: str) -> Dict:
         "detected_total_comments": detected_total_comments,
         "fetched_page": current_human_page,
         "fetched_total_pages": total_pages,
-        "page_text_excerpt": page_text[:400],
     }
 
 
 def find_comment_containers(soup: BeautifulSoup) -> List[Tag]:
-    """
-    A hozzászólások tipikusan ilyenek:
-      <div class="box" id="pd2630220"> ... </div>
-    """
     containers = []
-
-    for div in soup.select("div.box[id]"):
-        div_id = (div.get("id") or "").strip()
-        if re.match(r"^pd\d+$", div_id):
+    for div in soup.select("div.box"):
+        div_id = clean_text(div.get("id") or "")
+        if div_id and re.match(r"^pd\d+$", div_id):
             containers.append(div)
-
     return containers
 
 
@@ -654,91 +616,142 @@ def parse_comment_index(text: str) -> Tuple[Optional[int], Optional[int]]:
     return parse_int_from_text(m.group(1)), parse_int_from_text(m.group(2))
 
 
-def extract_comment_header_parts(box: Tag) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Próbálja kiszedni:
-      - author
-      - parent_author
-      - date
-    """
-    header_text = ""
+def extract_rating_and_likes_from_box(box: Tag, comment_id: Optional[str]) -> Tuple[Optional[int], Optional[str]]:
+    likes = None
+    rating = None
 
-    header_candidates = [
-        box.select_one(".boxhp"),
-        box.select_one(".boxh"),
-        box.select_one(".boxhead"),
-    ]
-    for node in header_candidates:
+    candidates: List[Tag] = []
+
+    if comment_id:
+        node = box.select_one(f"a#pry{comment_id}")
         if node:
-            header_text = clean_text(node.get_text(" ", strip=True))
-            if header_text:
-                break
+            candidates.append(node)
 
-    if not header_text:
-        # fallback: vegyük a box elején lévő szöveget body nélkül
-        header_text = clean_text(box.get_text(" ", strip=True))
+    candidates.extend(box.select("a[id^='pry']"))
 
+    seen = set()
+    unique_candidates = []
+    for c in candidates:
+        ident = id(c)
+        if ident not in seen:
+            seen.add(ident)
+            unique_candidates.append(c)
+
+    for node in unique_candidates:
+        span = node.select_one("span")
+        if span:
+            likes_text = clean_text(span.get_text(" ", strip=True))
+            parsed_likes = parse_int_from_text(likes_text)
+            if parsed_likes is not None:
+                likes = parsed_likes
+
+        title = clean_text(node.get("title", ""))
+        if title and "Értékelve eddig:" in title:
+            m = re.search(r"Értékelve eddig:\s*(.+)$", title, flags=re.I)
+            if m:
+                rating = clean_text(m.group(1))
+            else:
+                rating = title
+
+        if likes is not None or rating:
+            return likes, rating
+
+    return likes, rating
+
+
+def extract_header_node(box: Tag) -> Optional[Tag]:
+    for selector in ["div.boxhp", "div.boxh", "div.boxhead"]:
+        node = box.select_one(selector)
+        if node:
+            return node
+    return None
+
+
+def extract_date_from_header(header_node: Optional[Tag]) -> Optional[str]:
+    if not header_node:
+        return None
+
+    for th in header_node.select("table.fptbl th"):
+        txt = clean_text(th.get_text(" ", strip=True))
+        if not txt:
+            continue
+        if re.match(r"^[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]{3,}\s+\d{1,2},\s+\d{4}$", txt):
+            return txt
+
+    header_text = clean_text(header_node.get_text(" ", strip=True))
+    m = re.search(r"([A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]{3,}\s+\d{1,2},\s+\d{4})", header_text)
+    if m:
+        return clean_text(m.group(1))
+
+    return None
+
+
+def extract_author_and_parent_from_header(header_node: Optional[Tag], box: Tag) -> Tuple[Optional[str], Optional[str]]:
     author = None
     parent_author = None
-    date_text = None
 
-    # Dátum a végén pl. "Okt 29, 2024"
-    m_date = re.search(r"([A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]{3,}\s+\d{1,2},\s+\d{4})\s*$", header_text)
-    if m_date:
-        date_text = clean_text(m_date.group(1))
-        header_wo_date = clean_text(header_text[:m_date.start()])
-    else:
-        header_wo_date = header_text
+    if header_node:
+        header_links = []
+        for a in header_node.select("a[href]"):
+            txt = clean_text(a.get_text(" ", strip=True))
+            if txt and txt != "»":
+                header_links.append(txt)
 
-    header_wo_date = re.sub(r"\(\s*»\s*\)\s*$", "", header_wo_date).strip()
-    header_wo_date = re.sub(r"^\(\#\)\s*", "", header_wo_date).strip()
+        if header_links:
+            author = header_links[0]
 
-    m_reply = re.match(r"^(.*?)\s+válasza\s+(.*?)\s+hozzászólására\s*$", header_wo_date, flags=re.I)
-    if m_reply:
-        author = clean_text(m_reply.group(1))
-        parent_author = clean_text(m_reply.group(2))
-    else:
-        # Fallback: első link rendszerint a szerző
-        links = [clean_text(a.get_text(" ", strip=True)) for a in box.select("a[href]")]
-        links = [x for x in links if x]
-        if links:
-            author = links[0]
+        header_text = clean_text(header_node.get_text(" ", strip=True))
+        m_reply = re.search(r"^(.*?)\s+válasza\s+(.*?)\s+hozzászólására", header_text, flags=re.I)
+        if m_reply:
+            if not author:
+                author = clean_text(m_reply.group(1))
+            parent_author = clean_text(m_reply.group(2))
 
-        if not author:
-            # végső fallback: első szókapcsolat a headerből
-            m_author = re.match(r"^(.*?)(?:\s+\(|$)", header_wo_date)
-            if m_author:
-                author = clean_text(m_author.group(1))
+    if not author:
+        for a in box.select("a[href]"):
+            txt = clean_text(a.get_text(" ", strip=True))
+            if txt and txt != "»":
+                author = txt
+                break
 
-    return author, parent_author, date_text
+    return author, parent_author
 
 
 def extract_comment_from_container(container: Tag, topic_page_url: str) -> Optional[Dict]:
-    div_id = (container.get("id") or "").strip()
+    div_id = clean_text(container.get("id") or "")
     m_id = re.match(r"^pd(\d+)$", div_id)
     comment_id = m_id.group(1) if m_id else None
 
-    author, parent_author, date_text = extract_comment_header_parts(container)
+    header_node = extract_header_node(container)
+    boxpc = container.select_one("div.boxpc")
+    boxpa = container.select_one("div.boxpa")
+
+    author, parent_author = extract_author_and_parent_from_header(header_node, container)
+    date_text = extract_date_from_header(header_node)
+    likes, rating = extract_rating_and_likes_from_box(container, comment_id)
 
     if not author:
         author = "ismeretlen"
 
-    message_node = None
-    for selector in [".boxpc", ".boxp", ".content", ".text"]:
-        node = container.select_one(selector)
-        if node:
-            message_node = node
-            break
-
-    body = clean_text(message_node.get_text("\n", strip=True)) if message_node else ""
-
+    body = clean_text(boxpc.get_text("\n", strip=True)) if boxpc else ""
     whole_text = clean_text(container.get_text("\n", strip=True))
     comment_no, total_no = parse_comment_index(whole_text)
 
-    classes = " ".join(container.get("class", []))
     is_offtopic = False
+    classes = " ".join(container.get("class", []))
     if "offtopic" in classes.lower() or re.search(r"\bofftopic\b", whole_text, flags=re.I):
         is_offtopic = True
+
+    modified_text = clean_text(boxpa.get_text(" ", strip=True)) if boxpa else ""
+    modified_date = None
+    if modified_text:
+        m_mod = re.search(
+            r"A hozzászólás módosítva:\s*([A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]{3,}\s+\d{1,2},\s+\d{4})",
+            modified_text,
+            flags=re.I,
+        )
+        if m_mod:
+            modified_date = clean_text(m_mod.group(1))
 
     comment_url = strip_fragment(topic_page_url)
     if comment_id:
@@ -748,13 +761,15 @@ def extract_comment_from_container(container: Tag, topic_page_url: str) -> Optio
         "comment_id": comment_id,
         "author": author,
         "date": date_text,
-        "rating": None,
+        "likes": likes,
+        "rating": rating,
         "parent_author": parent_author,
         "index": comment_no,
         "index_total": total_no,
         "is_offtopic": is_offtopic,
         "url": comment_url,
         "data": body,
+        "modified_date": modified_date,
     }
 
 
@@ -774,7 +789,7 @@ def parse_comments_from_topic_page(html: str, topic_page_url: str) -> List[Dict]
         print(
             f"[DEBUG] Komment #{idx} | id={parsed.get('comment_id') or '-'} "
             f"| szerző={parsed.get('author')} | dátum={parsed.get('date')} "
-            f"| rating={parsed.get('rating')} | preview={preview}"
+            f"| likes={parsed.get('likes')} | rating={parsed.get('rating')} | preview={preview}"
         )
         comments.append(parsed)
 
@@ -820,11 +835,6 @@ def topic_page_looks_closed_or_unavailable(html: str) -> bool:
 
 
 def get_topic_prev_page_url(html: str, current_url: str) -> Optional[str]:
-    """
-    Visszalép az előző oldalra.
-    A topicot tipikusan az utolsó oldalról nyitja meg a fórum,
-    ezért visszafelé kell mennünk az elsőig.
-    """
     soup = BeautifulSoup(html, "html.parser")
     current_human_page, _ = parse_topic_displayed_page_info(html, current_url)
 
@@ -857,7 +867,6 @@ def get_topic_prev_page_url(html: str, current_url: str) -> Optional[str]:
     if smaller:
         return smaller[-1][1]
 
-    # fallback
     return set_query_param(get_topic_base_url(current_url), "pg", str(wanted_prev_idx))
 
 
@@ -870,7 +879,7 @@ def comment_to_output_item(c: Dict) -> Dict:
     return {
         "authors": [split_name_like_person(author_name)] if author_name else [],
         "data": c.get("data", ""),
-        "likes": None,
+        "likes": c.get("likes"),
         "dislikes": None,
         "score": None,
         "rating": c.get("rating"),
@@ -884,6 +893,7 @@ def comment_to_output_item(c: Dict) -> Dict:
             "index": c.get("index"),
             "index_total": c.get("index_total"),
             "is_offtopic": c.get("is_offtopic"),
+            "modified_date": c.get("modified_date"),
         },
     }
 
@@ -898,8 +908,6 @@ def parse_resume_page_from_comment_url(url: str) -> Optional[int]:
     human = get_topic_human_page_from_url(url)
     if human is not None:
         return human
-
-    # ha a mentett komment URL-ben nem volt pg, akkor ez valószínűleg az utolsó oldalról jött
     return None
 
 
@@ -1077,7 +1085,6 @@ def scrape_main(
         for x in load_visited(visited_file)
     }
 
-    # start_page itt emberi 1-alapú oldal
     start_idx = max(0, start_page - 1)
     current_url = MAIN_FORUM_URL if start_idx == 0 else set_query_param(MAIN_FORUM_URL, "pg", str(start_idx))
     page_no = start_page
@@ -1223,5 +1230,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    # Példa:
+  
     # python hobbye_scraper.py --output ./hobbielektronika --headed
