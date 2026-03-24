@@ -809,8 +809,9 @@ def parse_comments_from_topic_page(html: str, topic_page_url: str) -> List[Dict]
         preview = parsed["data"][:120].replace("\n", " | ")
         print(
             f"[DEBUG] Komment #{idx} | id={parsed.get('comment_id') or '-'} "
-            f"| szerző={parsed['author']} | like={parsed.get('likes')} "
-            f"| dislike={parsed.get('dislikes')} | preview={preview}"
+            f"| szerző={parsed['author']} | dátum={parsed.get('date') or '-'} "
+            f"| like={parsed.get('likes')} | dislike={parsed.get('dislikes')} "
+            f"| score={parsed.get('score')} | preview={preview}"
         )
         comments.append(parsed)
 
