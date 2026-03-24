@@ -13,24 +13,29 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup, Tag
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 
 BASE_URL = "https://www.agroinform.hu"
 MAIN_FORUM_URL = "https://www.agroinform.hu/forum"
-TOPIC_URL_RE = re.compile(r"^/forum/[^?#]+/t\d+(?:\?.*)?$", re.IGNORECASE)
-COMMENT_ID_RE = re.compile(r'"comment_id"\s*:\s*(?:"([^"]+)"|(\d+)|null)')
-COMMENT_URL_RE = re.compile(r'"url"\s*:\s*"([^"]+)"')
+
+TOPIC_URL_RE = re.compile(r"^https?://(?:www\.)?agroinform\.hu/forum/[^?#]+/t\d+(?:[?#].*)?$", re.I)
+TOPIC_HREF_RE = re.compile(r"^/forum/[^?#]+/t\d+(?:[?#].*)?$", re.I)
+
 DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\b")
 TOPIC_PAGE_SELECT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
-COMMENT_COUNT_HEADER_RE = re.compile(r"(\d+)\s+hozzászólás", re.IGNORECASE)
+COMMENT_COUNT_HEADER_RE = re.compile(r"(\d+)\s+hozzászólás", re.I)
+COMMENT_ID_RE = re.compile(r'"comment_id"\s*:\s*(?:"([^"]+)"|(\d+)|null)')
+COMMENT_URL_RE = re.compile(r'"url"\s*:\s*"([^"]+)"')
 
 
 # -----------------------------
-# Általános segédfüggvények
+# Segédfüggvények
 # -----------------------------
 
 def clean_text(text: str) -> str:
@@ -79,31 +84,7 @@ def now_iso() -> str:
 
 
 def strip_fragment(url: str) -> str:
-    parsed = urlparse(url)
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, parsed.query, ""))
-
-
-def extract_query_param(url: str, key: str) -> Optional[str]:
-    parsed = urlparse(url)
-    query = parse_qs(parsed.query)
-    vals = query.get(key)
-    return vals[0] if vals else None
-
-
-def set_query_param(url: str, key: str, value: str) -> str:
-    parsed = urlparse(url)
-    query = parse_qs(parsed.query)
-    query[key] = [value]
-    return urlunparse(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            parsed.params,
-            urlencode(query, doseq=True),
-            "",
-        )
-    )
+    return url.split("#", 1)[0]
 
 
 def parse_int_from_text(text: str) -> Optional[int]:
@@ -131,20 +112,15 @@ def split_name_like_person(name: str) -> Dict[str, str]:
     return {"name": name}
 
 
-def get_topic_base_url(url: str) -> str:
-    parsed = urlparse(strip_fragment(url))
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "", ""))
+def normalize_topic_url_for_visited(url: str) -> str:
+    return strip_fragment(url)
 
 
-def get_page_number(url: str) -> int:
-    page_val = extract_query_param(url, "page")
-    if page_val and page_val.isdigit():
-        return int(page_val)
-    return 1
-
-
-def parse_comment_page_number_from_comment_url(url: str) -> int:
-    return get_page_number(url)
+def comment_anchor_url(topic_page_url: str, comment_id: Optional[str]) -> str:
+    base = strip_fragment(topic_page_url)
+    if comment_id:
+        return f"{base}#comment-{comment_id}"
+    return base
 
 
 # -----------------------------
@@ -177,10 +153,6 @@ def load_visited(visited_file: Path) -> Set[str]:
 def append_visited(visited_file: Path, topic_url: str) -> None:
     with visited_file.open("a", encoding="utf-8") as f:
         f.write(topic_url.strip() + "\n")
-
-
-def normalize_topic_url_for_visited(url: str) -> str:
-    return get_topic_base_url(url)
 
 
 def topic_file_path(topics_dir: Path, topic_title: str) -> Path:
@@ -253,7 +225,7 @@ def write_topic_stream_header(topic_file: Path, resolved_title: str, topic_meta:
             "score": None,
             "rating": None,
             "date": topic_meta.get("created_at"),
-            "url": get_topic_base_url(topic_url),
+            "url": strip_fragment(topic_url),
             "language": "hu",
             "tags": [],
             "rights": "agroinform.hu fórum tartalom",
@@ -262,7 +234,7 @@ def write_topic_stream_header(topic_file: Path, resolved_title: str, topic_meta:
                 "topic_creator": topic_meta.get("topic_creator"),
                 "detected_total_comments": topic_meta.get("detected_total_comments"),
                 "detected_total_comment_pages": topic_meta.get("detected_total_comment_pages"),
-                "fetched_page": topic_meta.get("fetched_page"),
+                "comment_page_indicator_text": topic_meta.get("comment_page_indicator_text"),
             },
             "origin": "agroinform_forum",
         },
@@ -317,7 +289,7 @@ class BrowserFetcher:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/136.0.0.0 Safari/537.36"
             ),
-            viewport={"width": 1600, "height": 2400},
+            viewport={"width": 1700, "height": 2600},
         )
         self.page = self.context.new_page()
         return self
@@ -368,7 +340,6 @@ class BrowserFetcher:
         self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
         self.page.wait_for_timeout(wait_ms)
         self.accept_cookies_if_present()
-
         try:
             self.page.wait_for_load_state("networkidle", timeout=5000)
         except PlaywrightTimeoutError:
@@ -381,23 +352,85 @@ class BrowserFetcher:
         print(f"[DEBUG] HTML első 400 karakter:\n{html[:400]}\n")
         return final_url, html
 
+    def html(self) -> Tuple[str, str]:
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=5000)
+        except PlaywrightTimeoutError:
+            pass
+        self.page.wait_for_timeout(800)
+        return self.page.url, self.page.content()
+
+    def _click_next_arrow_generic(self) -> bool:
+        selectors = [
+            "a[title*='Következő oldal']",
+            "a[rel='next']",
+            "a:has(img[alt='Következő'])",
+            "a[href]:has(img[alt='Következő'])",
+            "img[alt='Következő']",
+        ]
+
+        for selector in selectors:
+            try:
+                locator = self.page.locator(selector).first
+                if locator.count() == 0:
+                    continue
+                if not locator.is_visible(timeout=1200):
+                    continue
+
+                before_url = self.page.url
+                before_html = self.page.content()
+
+                with self.page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                    locator.click(timeout=5000)
+
+                self.page.wait_for_timeout(1200)
+                try:
+                    self.page.wait_for_load_state("networkidle", timeout=5000)
+                except PlaywrightTimeoutError:
+                    pass
+
+                after_url = self.page.url
+                after_html = self.page.content()
+
+                if after_url != before_url or after_html != before_html:
+                    print("[DEBUG] Következő nyíl kattintás sikeres.")
+                    return True
+            except Exception:
+                pass
+
+        return False
+
+    def click_main_next_arrow(self) -> bool:
+        print("[DEBUG] Főoldali nyíl kattintás próbálása...")
+        return self._click_next_arrow_generic()
+
+    def click_topic_next_arrow(self) -> bool:
+        print("[DEBUG] Kommentoldali nyíl kattintás próbálása...")
+        return self._click_next_arrow_generic()
+
+    def open_topic_by_url(self, topic_url: str, wait_ms: int = 1500) -> Tuple[str, str]:
+        return self.fetch(topic_url, wait_ms=wait_ms)
+
 
 # -----------------------------
-# Főoldali topiclista parsing
+# Parsing: főoldal
 # -----------------------------
+
+def parse_page_indicator_texts(soup: BeautifulSoup) -> List[str]:
+    texts: List[str] = []
+    for node in soup.select("select, option, .dropdown-toggle, .dropdown-menu a, .row, .clearfix, .col"):
+        txt = clean_text(node.get_text(" ", strip=True))
+        if "/" in txt:
+            texts.append(txt)
+    return texts
+
 
 def parse_topic_list_page_info(soup: BeautifulSoup) -> Dict[str, Optional[int]]:
-    text = clean_text(soup.get_text(" ", strip=True))
     page_current = None
     page_total = None
 
-    candidates = []
-    for node in soup.select("select option, .dropdown-menu a, .dropdown-toggle, .row"):
-        t = clean_text(node.get_text(" ", strip=True))
-        if "/" in t:
-            candidates.append(t)
-
-    candidates.append(text)
+    candidates = parse_page_indicator_texts(soup)
+    candidates.append(clean_text(soup.get_text(" ", strip=True)))
 
     for t in candidates:
         for a, b in TOPIC_PAGE_SELECT_RE.findall(t):
@@ -406,9 +439,9 @@ def parse_topic_list_page_info(soup: BeautifulSoup) -> Dict[str, Optional[int]]:
             if ai and bi and bi <= 1000:
                 page_current = ai
                 page_total = bi
-                return {"page_current": page_current, "page_total": page_total}
+                return {"page_current": page_current, "page_total": page_total, "raw_text": t}
 
-    return {"page_current": None, "page_total": None}
+    return {"page_current": None, "page_total": None, "raw_text": None}
 
 
 def parse_topic_rows_from_main_page(html: str, page_url: str) -> Tuple[List[Dict], Dict[str, Optional[int]]]:
@@ -417,33 +450,39 @@ def parse_topic_rows_from_main_page(html: str, page_url: str) -> Tuple[List[Dict
     seen = set()
 
     page_info = parse_topic_list_page_info(soup)
-
     candidate_rows = soup.select("table.table-bordered tr, table tr, .table-bordered tr")
+
     print(f"[DEBUG] Főoldali topic sorok száma (nyers): {len(candidate_rows)}")
+    print(f"[DEBUG] Főoldali lapozó: {page_info.get('raw_text')}")
 
     for row in candidate_rows:
         topic_link = None
+
         for a in row.select("a[href]"):
-            href = (a.get("href") or "").strip()
-            if href and TOPIC_URL_RE.search(href):
+            href = clean_text(a.get("href") or "")
+            full = href if href.startswith("http") else (BASE_URL + href if href.startswith("/") else "")
+            if href and (TOPIC_HREF_RE.search(href) or TOPIC_URL_RE.search(full)):
                 topic_link = a
                 break
 
         if not topic_link:
             continue
 
+        href = clean_text(topic_link.get("href") or "")
+        topic_url = href if href.startswith("http") else BASE_URL + href
+        topic_url = normalize_topic_url_for_visited(topic_url)
+
         topic_title = clean_text(topic_link.get_text(" ", strip=True))
         if not topic_title or topic_title.lower() == "agroinform.hu fórumszabályzat":
             continue
 
-        topic_url = urljoin(page_url, topic_link.get("href", ""))
-        topic_url_norm = normalize_topic_url_for_visited(topic_url)
-        if topic_url_norm in seen:
+        if topic_url in seen:
             continue
-        seen.add(topic_url_norm)
+        seen.add(topic_url)
 
         row_text = clean_text(row.get_text("\n", strip=True))
         lines = [clean_text(x) for x in row_text.splitlines() if clean_text(x)]
+
         comment_count = None
         starter = None
         starter_date = None
@@ -458,26 +497,27 @@ def parse_topic_rows_from_main_page(html: str, page_url: str) -> Tuple[List[Dict
         if not dates:
             dates = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", row_text)
 
-        if len(lines) >= 2:
-            try:
-                title_idx = lines.index(topic_title)
-            except ValueError:
-                title_idx = 0
+        try:
+            title_idx = lines.index(topic_title)
+        except ValueError:
+            title_idx = 0
 
-            after = lines[title_idx + 1 :]
-            if after:
-                starter = after[0]
-            if len(after) >= 2 and re.search(r"\d{4}-\d{2}-\d{2}", after[1]):
+        after = lines[title_idx + 1:]
+
+        if len(after) >= 1:
+            starter = after[0]
+        if len(after) >= 2:
+            if re.search(r"\d{4}-\d{2}-\d{2}", after[1]):
                 starter_date = after[1]
-            if len(after) >= 3:
-                last_user = after[2]
-            if len(after) >= 4 and comment_count is not None:
-                last_activity = after[3]
+        if len(after) >= 3:
+            last_user = after[2]
+        if len(after) >= 4:
+            last_activity = after[3]
 
         topics.append(
             {
                 "title": topic_title,
-                "url": topic_url_norm,
+                "url": topic_url,
                 "comment_count": comment_count,
                 "starter": starter,
                 "starter_date": starter_date or (dates[0] if dates else None),
@@ -489,43 +529,8 @@ def parse_topic_rows_from_main_page(html: str, page_url: str) -> Tuple[List[Dict
     return topics, page_info
 
 
-def get_main_next_page_url(html: str, current_url: str) -> Optional[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    current_page = get_page_number(current_url)
-
-    selectors = [
-        "a[title*='Következő oldal'][href]",
-        "a[title*='kovetkezo oldal'][href]",
-        "a[rel='next'][href]",
-    ]
-    for selector in selectors:
-        node = soup.select_one(selector)
-        if node:
-            href = (node.get("href") or "").strip()
-            if href:
-                full = urljoin(current_url, href)
-                if get_page_number(full) > current_page:
-                    return full
-
-    for a in soup.select("a[href]"):
-        href = (a.get("href") or "").strip()
-        title = clean_text(a.get("title") or "")
-        txt = clean_text(a.get_text(" ", strip=True))
-        if not href:
-            continue
-        full = urljoin(current_url, href)
-        if not full.startswith(MAIN_FORUM_URL):
-            continue
-        if title.lower().startswith("következő oldal") or txt in {">", "›", "»"}:
-            if get_page_number(full) > current_page:
-                return full
-
-    guessed = set_query_param(MAIN_FORUM_URL, "page", str(current_page + 1))
-    return guessed
-
-
 # -----------------------------
-# Topicoldal parsing
+# Parsing: topicoldal
 # -----------------------------
 
 def extract_topic_title(html: str, fallback: str) -> str:
@@ -540,6 +545,24 @@ def extract_topic_title(html: str, fallback: str) -> str:
     return fallback
 
 
+def extract_comment_page_indicator_info(soup: BeautifulSoup) -> Dict[str, Optional[int]]:
+    candidates = parse_page_indicator_texts(soup)
+    candidates.append(clean_text(soup.get_text(" ", strip=True)))
+
+    best = {"page_current": None, "page_total": None, "raw_text": None}
+
+    for t in candidates:
+        for a, b in TOPIC_PAGE_SELECT_RE.findall(t):
+            ai = parse_int_from_text(a)
+            bi = parse_int_from_text(b)
+            if ai and bi and bi > 50:
+                return {"page_current": ai, "page_total": bi, "raw_text": t}
+            if ai and bi and best["page_total"] is None:
+                best = {"page_current": ai, "page_total": bi, "raw_text": t}
+
+    return best
+
+
 def extract_topic_meta(html: str, topic_url: str) -> Dict:
     soup = BeautifulSoup(html, "html.parser")
     page_text = clean_text(soup.get_text("\n", strip=True))
@@ -547,34 +570,30 @@ def extract_topic_meta(html: str, topic_url: str) -> Dict:
     topic_creator = None
     created_at = None
     total_comments = None
-    total_comment_pages = None
 
     h = COMMENT_COUNT_HEADER_RE.search(page_text)
     if h:
         total_comments = parse_int_from_text(h.group(1))
 
-    m = re.search(r"Létrehozta:\s*(.+?)\s*,\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", page_text, flags=re.I)
+    m = re.search(
+        r"Létrehozta:\s*(.+?)\s*,\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})",
+        page_text,
+        flags=re.I,
+    )
     if m:
         topic_creator = clean_text(m.group(1))
         created_at = clean_text(m.group(2))
 
-    for node in soup.select("select option, .dropdown-toggle, a[href]"):
-        t = clean_text(node.get_text(" ", strip=True))
-        mm = TOPIC_PAGE_SELECT_RE.search(t)
-        if mm:
-            a = parse_int_from_text(mm.group(1))
-            b = parse_int_from_text(mm.group(2))
-            if a and b and b > 50:
-                total_comment_pages = b
-                break
+    page_indicator = extract_comment_page_indicator_info(soup)
 
     return {
-        "url": get_topic_base_url(topic_url),
+        "url": strip_fragment(topic_url),
         "topic_creator": topic_creator,
         "created_at": created_at,
         "detected_total_comments": total_comments,
-        "detected_total_comment_pages": total_comment_pages,
-        "fetched_page": get_page_number(topic_url),
+        "detected_total_comment_pages": page_indicator.get("page_total"),
+        "detected_current_comment_page": page_indicator.get("page_current"),
+        "comment_page_indicator_text": page_indicator.get("raw_text"),
     }
 
 
@@ -591,7 +610,7 @@ def extract_comment_id(card: Tag) -> Optional[str]:
     node = card.select_one("div[id]")
     if not node:
         return None
-    cid = (node.get("id") or "").strip()
+    cid = clean_text(node.get("id") or "")
     return cid or None
 
 
@@ -613,6 +632,7 @@ def extract_comment_author(card: Tag) -> Optional[str]:
     m = re.search(r"#\d+\s+(.+?)\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", text)
     if m:
         return clean_text(m.group(1))
+
     return None
 
 
@@ -676,10 +696,6 @@ def extract_comment_from_card(card: Tag, topic_page_url: str) -> Optional[Dict]:
     if not comment_id and not body:
         return None
 
-    comment_url = strip_fragment(topic_page_url)
-    if comment_id:
-        comment_url = f"{comment_url}#comment-{comment_id}"
-
     return {
         "comment_id": comment_id,
         "author": author,
@@ -687,7 +703,7 @@ def extract_comment_from_card(card: Tag, topic_page_url: str) -> Optional[Dict]:
         "rating": None,
         "parent_author": parent_author,
         "parent_comment_id": parent_comment_id,
-        "url": comment_url,
+        "url": comment_anchor_url(topic_page_url, comment_id),
         "data": body,
     }
 
@@ -699,7 +715,9 @@ def parse_comments_from_topic_page(html: str, topic_page_url: str) -> Tuple[List
 
     print(
         f"[DEBUG] Komment kártyák száma: {len(cards)} | "
-        f"oldal={meta.get('fetched_page')} / {meta.get('detected_total_comment_pages')} | "
+        f"komment lapozó={meta.get('comment_page_indicator_text')} | "
+        f"aktuális oldal={meta.get('detected_current_comment_page')} | "
+        f"összes kommentoldal={meta.get('detected_total_comment_pages')} | "
         f"összes hozzászólás={meta.get('detected_total_comments')}"
     )
 
@@ -719,6 +737,11 @@ def parse_comments_from_topic_page(html: str, topic_page_url: str) -> Tuple[List
     return comments, meta
 
 
+def topic_has_any_comment_card(html: str) -> bool:
+    soup = BeautifulSoup(html, "html.parser")
+    return bool(find_comment_cards(soup))
+
+
 def build_comment_signature(comment: Dict) -> str:
     comment_id = str(comment.get("comment_id") or "")
     author = clean_text(comment.get("author") or "")
@@ -733,44 +756,6 @@ def build_page_fingerprint(comments: List[Dict]) -> str:
     sigs = [build_comment_signature(c) for c in comments]
     raw = "\n".join(sigs)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-
-def topic_has_any_comment_card(html: str) -> bool:
-    soup = BeautifulSoup(html, "html.parser")
-    return bool(find_comment_cards(soup))
-
-
-def get_topic_next_page_url(html: str, current_url: str) -> Optional[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    current_page = get_page_number(current_url)
-
-    selectors = [
-        "a[title*='Következő oldal'][href]",
-        "a[title*='kovetkezo oldal'][href]",
-        "a[rel='next'][href]",
-    ]
-    for selector in selectors:
-        node = soup.select_one(selector)
-        if node:
-            href = (node.get("href") or "").strip()
-            if href:
-                full = urljoin(current_url, href)
-                if get_page_number(full) > current_page:
-                    return full
-
-    for a in soup.select("a[href]"):
-        href = (a.get("href") or "").strip()
-        title = clean_text(a.get("title") or "")
-        txt = clean_text(a.get_text(" ", strip=True))
-        if not href:
-            continue
-        full = urljoin(current_url, href)
-        if get_page_number(full) <= current_page:
-            continue
-        if title.lower().startswith("következő oldal") or txt in {">", "›", "»"}:
-            return full
-
-    return set_query_param(get_topic_base_url(current_url), "page", str(current_page + 1))
 
 
 # -----------------------------
@@ -810,7 +795,6 @@ def scrape_topic(
     delay: float,
 ) -> int:
     existing_comments = 0
-    resume_page_no = 1
     resume_after_comment_id = None
     need_init_file = True
 
@@ -820,18 +804,16 @@ def scrape_topic(
             return count_existing_comments_in_stream_file(topic_file)
 
         last_comment_id, last_comment_url, existing_comments = get_last_written_comment_info(topic_file)
-        if last_comment_url:
-            resume_page_no = parse_comment_page_number_from_comment_url(last_comment_url)
+        if last_comment_id:
             resume_after_comment_id = last_comment_id
             need_init_file = False
             print(
-                f"[INFO] Meglévő félkész topicfájl, folytatás: page={resume_page_no}, "
-                f"utolsó comment_id={resume_after_comment_id}, meglévő kommentek={existing_comments}"
+                f"[INFO] Meglévő félkész topicfájl, folytatás az utolsó comment után | "
+                f"utolsó comment_id={resume_after_comment_id} | meglévő kommentek={existing_comments}"
             )
 
-    first_fetch_url = set_query_param(get_topic_base_url(topic_url), "page", str(resume_page_no))
     print(f"[INFO] Topic megnyitása: {topic_title}")
-    current_url, html = fetcher.fetch(first_fetch_url, wait_ms=int(delay * 1000))
+    current_url, html = fetcher.open_topic_by_url(topic_url, wait_ms=int(delay * 1000))
 
     resolved_title = extract_topic_title(html, topic_title)
     topic_meta = extract_topic_meta(html, current_url)
@@ -839,30 +821,30 @@ def scrape_topic(
     print(
         f"[DEBUG] Topic meta | cím={resolved_title} | létrehozó={topic_meta.get('topic_creator')} | "
         f"létrehozva={topic_meta.get('created_at')} | hozzászólások={topic_meta.get('detected_total_comments')} | "
-        f"kommentoldalak={topic_meta.get('detected_total_comment_pages')}"
+        f"kommentoldalak={topic_meta.get('detected_total_comment_pages')} | "
+        f"lapozó={topic_meta.get('comment_page_indicator_text')}"
     )
 
     if need_init_file:
         write_topic_stream_header(topic_file, resolved_title, topic_meta, topic_url)
         print(f"[INFO] Új streamelt topicfájl létrehozva: {topic_file}")
 
-    page_no = get_page_number(current_url)
     total_downloaded = existing_comments
     has_existing_comments = existing_comments > 0
 
     seen_page_fingerprints: Set[str] = set()
     previous_page_fingerprint: Optional[str] = None
-    first_page_after_resume = True
+    resume_done = False
 
     while True:
-        print(f"[INFO] Kommentoldal #{page_no}: {current_url}")
+        current_url, html = fetcher.html()
         page_comments, current_meta = parse_comments_from_topic_page(html, current_url)
 
-        if page_no > 1 and not page_comments:
-            print("[INFO] Üres vagy nem értelmezhető kommentoldal, megállok ennél a topicnál.")
+        if not page_comments and total_downloaded > 0:
+            print("[INFO] Ez az oldal nem tartalmaz értelmezhető kommenteket, megállok ennél a topicnál.")
             break
 
-        if first_page_after_resume and resume_after_comment_id:
+        if resume_after_comment_id and not resume_done:
             original_len = len(page_comments)
             seen_last = False
             filtered: List[Dict] = []
@@ -876,15 +858,29 @@ def scrape_topic(
 
             if seen_last:
                 print(
-                    f"[INFO] Resume szűrés: az első oldalon {original_len} kommentből "
+                    f"[INFO] Resume szűrés: ezen az oldalon {original_len} kommentből "
                     f"{len(filtered)} új maradt az utolsó mentett comment_id után."
                 )
                 page_comments = filtered
+                resume_done = True
             else:
-                print("[INFO] Resume: az utolsó mentett comment_id nincs ezen az oldalon, teljes oldalt újként kezelem.")
+                print(
+                    "[INFO] Resume: az utolsó mentett comment_id nincs ezen az oldalon. "
+                    "Tovább kattintok a következő kommentoldalra."
+                )
 
-            first_page_after_resume = False
-            resume_after_comment_id = None
+                current_fingerprint = build_page_fingerprint(page_comments)
+                if current_fingerprint in seen_page_fingerprints:
+                    print("[INFO] Már látott kommentoldalra jutottam resume közben, leállok.")
+                    break
+                seen_page_fingerprints.add(current_fingerprint)
+
+                clicked = fetcher.click_topic_next_arrow()
+                if not clicked:
+                    print("[INFO] Resume közben nincs több kommentoldal.")
+                    break
+                fetcher.page.wait_for_timeout(int(delay * 1000))
+                continue
 
         current_fingerprint = build_page_fingerprint(page_comments)
         print(f"[DEBUG] Oldal fingerprint: {current_fingerprint}")
@@ -906,6 +902,7 @@ def scrape_topic(
             has_existing_comments = True
             total_downloaded += 1
             added_on_this_page += 1
+
             print(
                 f"[DEBUG] Mentve | id={c.get('comment_id')} | szerző={c.get('author')} | "
                 f"dátum={c.get('date')} | fájl={topic_file.name}"
@@ -915,31 +912,37 @@ def scrape_topic(
             f"[INFO] Oldal hozzáfűzve a topicfájlhoz: {topic_file} | "
             f"új kommentek ezen az oldalon: {added_on_this_page} | "
             f"összes letöltött komment eddig: {total_downloaded} | "
-            f"oldal={page_no}/{current_meta.get('detected_total_comment_pages')}"
+            f"komment lapozó={current_meta.get('comment_page_indicator_text')}"
         )
 
-        if current_meta.get("detected_total_comment_pages") and page_no >= int(current_meta["detected_total_comment_pages"]):
+        current_page = current_meta.get("detected_current_comment_page")
+        total_pages = current_meta.get("detected_total_comment_pages")
+        if current_page and total_pages and int(current_page) >= int(total_pages):
             print("[INFO] Elértem az utolsó kommentoldalt a lapozó alapján.")
             break
 
-        next_url = get_topic_next_page_url(html, current_url)
-        if not next_url:
+        before_url = fetcher.page.url
+        before_html = fetcher.page.content()
+
+        clicked = fetcher.click_topic_next_arrow()
+        if not clicked:
             print("[INFO] Nincs több kommentoldal ennél a topicnál.")
             break
 
-        next_page_no = get_page_number(next_url)
-        if next_page_no <= page_no:
-            print("[INFO] A következő oldal száma nem nagyobb a mostaninál, leállok.")
+        fetcher.page.wait_for_timeout(int(delay * 1000))
+
+        after_url = fetcher.page.url
+        after_html = fetcher.page.content()
+
+        if after_url == before_url and after_html == before_html:
+            print("[INFO] A kattintás után nem változott az oldal, megállok.")
             break
 
-        print(f"[INFO] Következő kommentoldal jelölt: {next_url}")
-
-        fetched_next_url, next_html = fetcher.fetch(next_url, wait_ms=int(delay * 1000))
-        if not topic_has_any_comment_card(next_html):
-            print("[INFO] A következő oldal már nem tartalmaz kommenteket, megállok.")
+        if not topic_has_any_comment_card(after_html):
+            print("[INFO] A következő oldal már nem tartalmaz kommentkártyát, megállok.")
             break
 
-        next_comments, _ = parse_comments_from_topic_page(next_html, fetched_next_url)
+        next_comments, _ = parse_comments_from_topic_page(after_html, after_url)
         next_fingerprint = build_page_fingerprint(next_comments)
         print(f"[DEBUG] Következő oldal fingerprint: {next_fingerprint}")
 
@@ -952,9 +955,6 @@ def scrape_topic(
             break
 
         previous_page_fingerprint = current_fingerprint
-        current_url = fetched_next_url
-        html = next_html
-        page_no = get_page_number(current_url)
 
     finalize_stream_json(topic_file)
     print(f"[DEBUG] Topic letöltés kész: {resolved_title} | összes letöltött komment: {total_downloaded}")
@@ -979,27 +979,55 @@ def scrape_main(
 
     visited_topics = {normalize_topic_url_for_visited(x) for x in load_visited(visited_file)}
 
-    current_url = MAIN_FORUM_URL if start_page <= 1 else set_query_param(MAIN_FORUM_URL, "page", str(start_page))
-    page_no = start_page
+    current_url, html = fetcher.fetch(MAIN_FORUM_URL, wait_ms=int(delay * 1000))
+
+    # Ha nem az első oldalról indulunk, kattintással lépkedünk oda.
+    if start_page > 1:
+        print(f"[INFO] Kezdő főoldali oldalra kattintással léptetek: {start_page}")
+        current_main_page_no = 1
+        while current_main_page_no < start_page:
+            clicked = fetcher.click_main_next_arrow()
+            if not clicked:
+                print("[WARN] Nem tudtam eljutni a kívánt start-page oldalra, megállok az aktuálisnál.")
+                break
+            fetcher.page.wait_for_timeout(int(delay * 1000))
+            current_url, html = fetcher.html()
+            _, page_info = parse_topic_rows_from_main_page(html, current_url)
+            detected = page_info.get("page_current")
+            if detected:
+                current_main_page_no = int(detected)
+            else:
+                current_main_page_no += 1
+
     processed_main_pages = 0
+    seen_main_page_fingerprints: Set[str] = set()
 
     while True:
         if max_pages is not None and processed_main_pages >= max_pages:
             print("[INFO] Elértem a max-pages limitet.")
             break
 
-        print(f"\n[INFO] Főoldali topiclista oldal #{page_no}: {current_url}")
-        final_url, html = fetcher.fetch(current_url, wait_ms=int(delay * 1000))
+        current_url, html = fetcher.html()
+        topics, page_info = parse_topic_rows_from_main_page(html, current_url)
 
-        topics, page_info = parse_topic_rows_from_main_page(html, final_url)
         print(
-            f"[INFO] Talált topicok ezen az oldalon: {len(topics)} | "
-            f"fórum oldal={page_info.get('page_current')} / {page_info.get('page_total')}"
+            f"\n[INFO] Főoldali topiclista oldal: {page_info.get('page_current')} / {page_info.get('page_total')} | "
+            f"lapozó={page_info.get('raw_text')}"
         )
+        print(f"[INFO] Talált topicok ezen az oldalon: {len(topics)}")
 
         if not topics:
             print("[INFO] Nem találtam topicokat ezen a lapon, leállok.")
             break
+
+        topic_urls_for_fingerprint = "\n".join(t["url"] for t in topics)
+        main_fp = hashlib.sha1(topic_urls_for_fingerprint.encode("utf-8")).hexdigest()
+        print(f"[DEBUG] Főoldali fingerprint: {main_fp}")
+
+        if main_fp in seen_main_page_fingerprints:
+            print("[INFO] Már látott főoldali topiclista jött vissza, leállok.")
+            break
+        seen_main_page_fingerprints.add(main_fp)
 
         for idx, topic in enumerate(topics, start=1):
             topic_title = topic["title"]
@@ -1042,25 +1070,50 @@ def scrape_main(
             except Exception as e:
                 print(f"[WARN] Hiba topic feldolgozás közben: {topic_url} | {e}")
 
+            # Vissza a főoldalra ugyanarra a topiclistára.
+            current_url, html = fetcher.fetch(MAIN_FORUM_URL, wait_ms=int(delay * 1000))
+
+            # Visszakattintunk addig, amíg elérjük ugyanazt a főoldali listázó oldalt.
+            target_page = page_info.get("page_current") or 1
+            current_page_no = 1
+
+            while current_page_no < int(target_page):
+                clicked = fetcher.click_main_next_arrow()
+                if not clicked:
+                    print("[WARN] Nem tudtam visszalépni a megfelelő főoldali lapra.")
+                    break
+                fetcher.page.wait_for_timeout(int(delay * 1000))
+                current_url, html = fetcher.html()
+                _, pi = parse_topic_rows_from_main_page(html, current_url)
+                detected = pi.get("page_current")
+                if detected:
+                    current_page_no = int(detected)
+                else:
+                    current_page_no += 1
+
         processed_main_pages += 1
 
-        if page_info.get("page_total") and page_info.get("page_current"):
-            if int(page_info["page_current"]) >= int(page_info["page_total"]):
-                print("[INFO] Elértem az utolsó főoldali topiclistát a lapozó alapján.")
-                break
+        page_current = page_info.get("page_current")
+        page_total = page_info.get("page_total")
+        if page_current and page_total and int(page_current) >= int(page_total):
+            print("[INFO] Elértem az utolsó főoldali topiclistát a lapozó alapján.")
+            break
 
-        next_url = get_main_next_page_url(html, final_url)
-        if not next_url:
+        before_url = fetcher.page.url
+        before_html = fetcher.page.content()
+
+        clicked = fetcher.click_main_next_arrow()
+        if not clicked:
             print("[INFO] Nincs több főoldali topiclista oldal.")
             break
 
-        next_page_no = get_page_number(next_url)
-        if next_page_no <= page_no:
-            print("[INFO] Nem léptethető tovább a főoldali lapozás.")
-            break
+        fetcher.page.wait_for_timeout(int(delay * 1000))
+        after_url = fetcher.page.url
+        after_html = fetcher.page.content()
 
-        current_url = next_url
-        page_no = next_page_no
+        if after_url == before_url and after_html == before_html:
+            print("[INFO] A főoldali kattintás után nem változott az oldal, leállok.")
+            break
 
 
 # -----------------------------
@@ -1069,7 +1122,7 @@ def scrape_main(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="agroinform.hu fórum scraper Playwright + BeautifulSoup alapon, streamelt komment-append módban"
+        description="agroinform.hu fórum scraper Playwright + BeautifulSoup alapon, streamelt komment-append módban, kattintásos lapozással"
     )
     parser.add_argument(
         "--output",
@@ -1091,7 +1144,7 @@ def parse_args() -> argparse.Namespace:
         "--start-page",
         type=int,
         default=1,
-        help="A fórum főoldali lapozásának kezdő oldala.",
+        help="A fórum főoldali lapozásának kezdő oldala. KATTINTÁSSAL érjük el, nem URL-lel.",
     )
     parser.add_argument(
         "--max-pages",
@@ -1130,4 +1183,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    # python agroinform_scraper.py --output ./out --headed --start-page 1 --max-pages 1
+       # python agroinform_scraper.py --output ./agro --headed --start-page 1 --max-pages 1
