@@ -10,7 +10,6 @@ import re
 import sys
 import textwrap
 import unicodedata
-import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -267,9 +266,17 @@ def finalize_stream_json(topic_file: Path) -> None:
 
 
 class BrowserFetcher:
-    def __init__(self, headless: bool = True, slow_mo: int = 0):
+    def __init__(
+        self,
+        headless: bool = True,
+        slow_mo: int = 0,
+        timeout_ms: int = 90000,
+        retries: int = 4,
+    ):
         self.headless = headless
         self.slow_mo = slow_mo
+        self.timeout_ms = timeout_ms
+        self.retries = retries
         self.playwright = None
         self.browser = None
         self.context = None
@@ -291,6 +298,8 @@ class BrowserFetcher:
             viewport={"width": 1700, "height": 2600},
         )
         self.page = self.context.new_page()
+        self.page.set_default_timeout(self.timeout_ms)
+        self.page.set_default_navigation_timeout(self.timeout_ms)
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -315,6 +324,17 @@ class BrowserFetcher:
         except Exception:
             pass
 
+    def reset_page(self) -> None:
+        try:
+            if self.page:
+                self.page.close()
+        except Exception:
+            pass
+        self.page = self.context.new_page()
+        self.page.set_default_timeout(self.timeout_ms)
+        self.page.set_default_navigation_timeout(self.timeout_ms)
+        print("[INFO] Böngészőoldal újranyitva a stabilabb működéshez.")
+
     def accept_cookies_if_present(self) -> None:
         candidates = [
             "button:has-text('Elfogadom')",
@@ -335,25 +355,58 @@ class BrowserFetcher:
                 pass
 
     def fetch(self, url: str, wait_ms: int = 1500) -> Tuple[str, str]:
-        print(f"[DEBUG] LETÖLTVE: {url}")
-        self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        self.page.wait_for_timeout(wait_ms)
-        self.accept_cookies_if_present()
-        try:
-            self.page.wait_for_load_state("networkidle", timeout=5000)
-        except PlaywrightTimeoutError:
-            pass
+        last_exc = None
 
-        final_url = self.page.url
-        html = self.page.content()
-        return final_url, html
+        for attempt in range(1, self.retries + 1):
+            try:
+                print(f"[DEBUG] LETÖLTVE ({attempt}/{self.retries}): {url}")
+                self.page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+                self.page.wait_for_timeout(wait_ms)
+                self.accept_cookies_if_present()
+
+                try:
+                    self.page.wait_for_load_state("networkidle", timeout=5000)
+                except PlaywrightTimeoutError:
+                    pass
+
+                final_url = self.page.url
+                html = self.page.content()
+                return final_url, html
+
+            except PlaywrightTimeoutError as e:
+                last_exc = e
+                print(f"[WARN] Timeout ({attempt}/{self.retries}) -> {url}")
+
+            except Exception as e:
+                last_exc = e
+                print(f"[WARN] Fetch hiba ({attempt}/{self.retries}) -> {url} | {e}")
+
+            if attempt < self.retries:
+                backoff_ms = 3000 * attempt
+                print(f"[WARN] Újrapróbálás {backoff_ms / 1000:.1f} mp múlva...")
+                try:
+                    self.page.wait_for_timeout(backoff_ms)
+                except Exception:
+                    pass
+
+                try:
+                    self.page.goto("about:blank", timeout=10000)
+                except Exception:
+                    pass
+
+                try:
+                    self.reset_page()
+                except Exception:
+                    pass
+
+        raise last_exc
 
     def get_next_page_url(self) -> Optional[str]:
         script = """
         () => {
             const nextLink = document.querySelector('a[title*="Következő oldal"], a[rel="next"]');
             if (nextLink) {
-                return nextLink.href; 
+                return nextLink.href;
             }
             const img = document.querySelector('img[alt="Következő"]');
             if (img && img.closest('a')) {
@@ -519,7 +572,7 @@ class BrowserFetcher:
   for (const card of cards) {
     const idNode = card.querySelector('div[id]');
     if (!idNode) continue;
-    
+
     const cid = norm(idNode.getAttribute('id'));
     const authorNode = card.querySelector('.comment-author') || card.querySelector('a[href*="/profil/"]');
     let author = norm(authorNode ? (authorNode.innerText || authorNode.textContent || '') : '');
@@ -546,7 +599,7 @@ class BrowserFetcher:
 
     const clone = card.cloneNode(true);
     const removeSelectors = ['.float-right.clearfix.header-bar', '.header-bar', '.comment-author', 'div.d-block.d-sm-inline', 'button', 'script', 'style', 'form'];
-    
+
     for (const sel of removeSelectors) {
       for (const n of Array.from(clone.querySelectorAll(sel))) {
         n.remove();
@@ -762,6 +815,51 @@ def comment_to_output_item(c: Dict) -> Dict:
     }
 
 
+def reopen_main_page_and_return_to_position(
+    fetcher: BrowserFetcher,
+    delay: float,
+    target_page: int,
+) -> bool:
+    try:
+        fetcher.fetch(MAIN_FORUM_URL, wait_ms=int(delay * 1000))
+    except Exception as e:
+        print(f"[WARN] Nem sikerült visszatölteni a főoldalt: {e}")
+        try:
+            fetcher.reset_page()
+            fetcher.fetch(MAIN_FORUM_URL, wait_ms=int(delay * 1000))
+        except Exception as e2:
+            print(f"[WARN] Második próbára sem sikerült visszatölteni a főoldalt: {e2}")
+            return False
+
+    current_page_no = 1
+    while current_page_no < int(target_page):
+        next_url = fetcher.get_next_page_url()
+        if not next_url:
+            print("[WARN] A főoldal kívánt oldalára nem tudtam visszalapozni.")
+            return False
+
+        try:
+            fetcher.fetch(next_url, wait_ms=int(delay * 1000))
+        except Exception as e:
+            print(f"[WARN] Hiba a főoldali visszalapozás közben: {e}")
+            try:
+                fetcher.reset_page()
+                fetcher.fetch(next_url, wait_ms=int(delay * 1000))
+            except Exception as e2:
+                print(f"[WARN] A főoldali visszalapozás újrapróbálása is sikertelen: {e2}")
+                return False
+
+        pairs = fetcher.extract_page_pairs_current_page()
+        pi = choose_best_page_indicator(pairs, prefer_large_total=False)
+        detected = pi.get("page_current")
+        if detected:
+            current_page_no = int(detected)
+        else:
+            current_page_no += 1
+
+    return True
+
+
 def scrape_topic(
     fetcher: BrowserFetcher,
     topic_title: str,
@@ -792,7 +890,7 @@ def scrape_topic(
 
     entry_url = resume_from_url or topic_url
     print(f"\n[INFO] Téma megnyitása letöltésre: {topic_title}")
-    
+
     fetcher.open_topic_by_url(entry_url, wait_ms=int(delay * 1000))
 
     resolved_title = extract_topic_title_from_fetcher(fetcher, topic_title)
@@ -807,17 +905,17 @@ def scrape_topic(
     seen_page_fingerprints: Set[str] = set()
     previous_page_fingerprint: Optional[str] = None
     resume_done = False
+    page_hops = 0
 
     while True:
         current_url = fetcher.page.url
         page_comments, current_meta = parse_comments_from_fetcher(fetcher, current_url)
 
         if not page_comments and total_downloaded > 0:
-            print("[WARN] Ez az oldal nem tartalmaz kommentkártyákat, valószínűleg rossz helyre navgáltunk. Kilépés a témából.")
+            print("[WARN] Ez az oldal nem tartalmaz kommentkártyákat, valószínűleg rossz helyre navigáltunk. Kilépés a témából.")
             break
 
         if resume_after_comment_id and not resume_done:
-            original_len = len(page_comments)
             seen_last = False
             filtered: List[Dict] = []
 
@@ -842,8 +940,16 @@ def scrape_topic(
                 next_url = fetcher.get_next_page_url()
                 if not next_url:
                     break
-                
-                fetcher.open_topic_by_url(next_url, wait_ms=int(delay * 1000))
+
+                try:
+                    fetcher.open_topic_by_url(next_url, wait_ms=int(delay * 1000))
+                    page_hops += 1
+                    if page_hops % 25 == 0:
+                        fetcher.reset_page()
+                        fetcher.open_topic_by_url(next_url, wait_ms=int(delay * 1000))
+                except Exception as e:
+                    print(f"[WARN] Hiba resume közbeni lapozáskor: {e}")
+                    break
                 continue
 
         current_fingerprint = build_page_fingerprint(page_comments)
@@ -866,29 +972,41 @@ def scrape_topic(
             total_downloaded += 1
             added_on_this_page += 1
 
-            # --- ÚJ DEBUG LOGOLÁS A KONZOLRA ---
             author_log = c.get("author") or "ismeretlen"
             date_log = c.get("date") or "ismeretlen dátum"
             data_log = (c.get("data") or "").replace("\n", " ").strip()
             if len(data_log) > 60:
                 data_log = data_log[:57] + "..."
-            
-            print(f"    [DEBUG] {author_log}({date_log}): {data_log}")
-            # -----------------------------------
 
-        current_page_no = current_meta.get('detected_current_comment_page') or "?"
-        total_pages_no = current_meta.get('detected_total_comment_pages') or "?"
-        total_comm = current_meta.get('detected_total_comments') or "?"
-        
-        print(f"[INFO] Oldal kigyűjtve | Állás: {current_page_no}/{total_pages_no} oldal | Összes db az oldalon feltüntetve: {total_comm} | Eddig leszedve: {total_downloaded}")
+            print(f"    [DEBUG] {author_log}({date_log}): {data_log}")
+
+        current_page_no = current_meta.get("detected_current_comment_page") or "?"
+        total_pages_no = current_meta.get("detected_total_comment_pages") or "?"
+        total_comm = current_meta.get("detected_total_comments") or "?"
+
+        print(
+            f"[INFO] Oldal kigyűjtve | Állás: {current_page_no}/{total_pages_no} oldal | "
+            f"Összes db az oldalon feltüntetve: {total_comm} | "
+            f"Most hozzáadva: {added_on_this_page} | Eddig leszedve: {total_downloaded}"
+        )
 
         next_url = fetcher.get_next_page_url()
         if not next_url:
-            print(f"[INFO] Téma letöltése befejeződött, a 'Következő oldal' gomb fizikailag elfogyott az oldalon.")
+            print("[INFO] Téma letöltése befejeződött, a 'Következő oldal' gomb fizikailag elfogyott az oldalon.")
             break
 
         print(f"[DEBUG] Navigálás a következő kommentoldalra -> {next_url}")
-        fetcher.open_topic_by_url(next_url, wait_ms=int(delay * 1000))
+
+        try:
+            fetcher.open_topic_by_url(next_url, wait_ms=int(delay * 1000))
+            page_hops += 1
+            if page_hops % 25 == 0:
+                print("[INFO] Hosszú futás közbeni stabilizáló oldal-reset.")
+                fetcher.reset_page()
+                fetcher.open_topic_by_url(next_url, wait_ms=int(delay * 1000))
+        except Exception as e:
+            print(f"[WARN] Hiba a következő kommentoldal megnyitásakor: {e}")
+            break
 
         previous_page_fingerprint = current_fingerprint
 
@@ -920,7 +1038,7 @@ def scrape_main(
             if not next_url:
                 print("[WARN] Nem tudtam eljutni a kívánt start-page oldalra.")
                 break
-            
+
             fetcher.fetch(next_url, wait_ms=int(delay * 1000))
             pairs = fetcher.extract_page_pairs_current_page()
             page_info = choose_best_page_indicator(pairs, prefer_large_total=False)
@@ -943,10 +1061,12 @@ def scrape_main(
 
         pairs = fetcher.extract_page_pairs_current_page()
         page_info = choose_best_page_indicator(pairs, prefer_large_total=False)
+        current_main_page = page_info.get("page_current") or 1
+        total_main_pages = page_info.get("page_total")
 
         print(
             f"\n======================================================\n"
-            f"[INFO] Főoldali Témalista Feldolgozása | Állás: {page_info.get('page_current')} / {page_info.get('page_total')}\n"
+            f"[INFO] Főoldali Témalista Feldolgozása | Állás: {current_main_page} / {total_main_pages}\n"
             f"======================================================"
         )
 
@@ -962,12 +1082,17 @@ def scrape_main(
             break
         seen_main_page_fingerprints.add(main_fp)
 
-        for idx, topic in enumerate(topics, start=1):
+        topics_snapshot = list(topics)
+
+        for idx, topic in enumerate(topics_snapshot, start=1):
             topic_title = topic["title"]
             topic_url = topic["url"]
             topic_url_norm = normalize_topic_url_for_visited(topic_url)
 
+            print(f"\n[INFO] Topic {idx}/{len(topics_snapshot)} ezen a főoldalon: {topic_title}")
+
             if only_title and only_title.lower() not in topic_title.lower():
+                print("[SKIP] Cím-szűrő miatt kihagyva.")
                 continue
 
             if topic_url_norm in visited_topics:
@@ -987,28 +1112,19 @@ def scrape_main(
 
                 append_visited(visited_file, topic_url_norm)
                 visited_topics.add(topic_url_norm)
-                print(f"[SUCCESS] {topic_title} hozzáadva a visited listához!")
+                print(f"[SUCCESS] {topic_title} hozzáadva a visited listához! Kommentek: {total_downloaded}")
 
             except Exception as e:
                 print(f"[FATAL ERROR] Hiba a(z) '{topic_title}' feldolgozásánál: {e}")
 
-            fetcher.fetch(MAIN_FORUM_URL, wait_ms=int(delay * 1000))
-            target_page = page_info.get("page_current") or 1
-            current_page_no = 1
-
-            while current_page_no < int(target_page):
-                next_url = fetcher.get_next_page_url()
-                if not next_url:
-                    break
-                fetcher.fetch(next_url, wait_ms=int(delay * 1000))
-                
-                pairs = fetcher.extract_page_pairs_current_page()
-                pi = choose_best_page_indicator(pairs, prefer_large_total=False)
-                detected = pi.get("page_current")
-                if detected:
-                    current_page_no = int(detected)
-                else:
-                    current_page_no += 1
+            ok = reopen_main_page_and_return_to_position(
+                fetcher=fetcher,
+                delay=delay,
+                target_page=int(current_main_page),
+            )
+            if not ok:
+                print("[WARN] Nem tudtam stabilan visszaállni a főoldali pozícióra. A script innen leáll.")
+                return
 
         processed_main_pages += 1
 
@@ -1016,13 +1132,22 @@ def scrape_main(
         if not next_url:
             print("[INFO] Nincs több lapozható oldal a főoldalon. Befejezés.")
             break
-            
-        fetcher.fetch(next_url, wait_ms=int(delay * 1000))
+
+        try:
+            fetcher.fetch(next_url, wait_ms=int(delay * 1000))
+        except Exception as e:
+            print(f"[WARN] Nem sikerült a következő főoldali listára navigálni: {e}")
+            try:
+                fetcher.reset_page()
+                fetcher.fetch(next_url, wait_ms=int(delay * 1000))
+            except Exception as e2:
+                print(f"[FATAL] A következő főoldali lista második próbára sem nyitható meg: {e2}")
+                break
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="agroinform.hu fórum letöltő - URL alapú hibamentes lapozással."
+        description="agroinform.hu fórum letöltő - URL alapú hibamentesebb lapozással és retry mechanizmussal."
     )
     parser.add_argument(
         "--output",
@@ -1032,7 +1157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--delay",
         type=float,
-        default=1.5,
+        default=3.0,
         help="Várakozás másodpercben a hálózatnak.",
     )
     parser.add_argument(
@@ -1055,7 +1180,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--headed",
         action="store_true",
-        help="Böngésző GUI megjelenítése (Hibakereséshez).",
+        help="Böngésző GUI megjelenítése (hibakereséshez).",
+    )
+    parser.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=90000,
+        help="Navigációs timeout ezredmásodpercben.",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=4,
+        help="Ennyiszer próbálja újra a fetch műveleteket.",
     )
     return parser.parse_args()
 
@@ -1063,7 +1200,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     try:
-        with BrowserFetcher(headless=not args.headed, slow_mo=50 if args.headed else 0) as fetcher:
+        with BrowserFetcher(
+            headless=not args.headed,
+            slow_mo=50 if args.headed else 0,
+            timeout_ms=args.timeout_ms,
+            retries=args.retries,
+        ) as fetcher:
             scrape_main(
                 fetcher=fetcher,
                 output_dir=args.output,
@@ -1081,4 +1223,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()                         # python agroinform_scraper.py --output ./agro --headed --start-page 1 --max-pages 1
+    main()   
+    
+                           # python agroinform_scraper.py --output ./agro --headed --start-page 1 --max-pages 1
