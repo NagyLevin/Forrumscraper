@@ -1225,4 +1225,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()   
     
-                           # python agroinform_scraper.py --output ./agro --headed --start-page 1 --max-pages 1
+                           # python agroinform_scraper.py --output ./agro --headed --start-page 1 --max-pages 38

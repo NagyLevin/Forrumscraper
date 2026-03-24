@@ -28,6 +28,16 @@ SHOW_ARTICLE_RE = re.compile(
 
 URL_FIELD_RE = re.compile(r'"url"\s*:\s*"([^"]+)"')
 
+ABSOLUTE_DATE_RE = re.compile(
+    r"\b[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.?(?:\s+[0-9]{1,2}:[0-9]{2})?\b",
+    re.IGNORECASE,
+)
+
+RELATIVE_DATE_RE = re.compile(
+    r"\b\d+\s+(?:perce|órája|napja|hete|hónapja|éve)\b",
+    re.IGNORECASE,
+)
+
 
 def clean_text(text: str) -> str:
     if not text:
@@ -210,15 +220,6 @@ def find_last_comment_url_from_file(path: Path) -> Optional[str]:
     return None
 
 
-def remove_trailing_whitespace(path: Path) -> None:
-    if not path.exists():
-        return
-
-    data = path.read_bytes().rstrip()
-    with path.open("wb") as f:
-        f.write(data)
-
-
 def init_open_json_file_if_needed(
     topic_file: Path,
     resolved_title: str,
@@ -333,6 +334,46 @@ def derive_next_page_from_comment_url(comment_url: str) -> Optional[str]:
     resumed = set_query_param(base_url, "na_start", str(next_start))
     resumed = set_query_param(resumed, "na_step", str(int(na_step)))
     return strip_fragment(resumed)
+
+
+def parse_votes_from_header_row(header_row: Optional[Tag]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    if not header_row:
+        return None, None, None
+
+    rat = header_row.select_one("span.art_rat")
+    if not rat:
+        return None, None, None
+
+    left_span = rat.select_one("span.art_rat_lft")
+    dislikes = parse_int_from_text(left_span.get_text(" ", strip=True)) if left_span else 0
+
+    positive_anchor = rat.select_one("a.art_rat_pl-i")
+    likes = 0
+
+    if positive_anchor:
+        next_text_parts = []
+        for sib in positive_anchor.next_siblings:
+            if isinstance(sib, str):
+                txt = clean_text(sib)
+                if txt:
+                    next_text_parts.append(txt)
+            elif isinstance(sib, Tag):
+                if sib.name == "a":
+                    continue
+                txt = clean_text(sib.get_text(" ", strip=True))
+                if txt:
+                    next_text_parts.append(txt)
+
+        if next_text_parts:
+            likes = parse_int_from_text(" ".join(next_text_parts))
+
+    if likes is None:
+        likes = 0
+    if dislikes is None:
+        dislikes = 0
+
+    score = likes - dislikes
+    return likes, dislikes, score
 
 
 class BrowserFetcher:
@@ -590,6 +631,8 @@ def get_subforum_next_page_url(html: str, current_url: str) -> Optional[str]:
     soup = BeautifulSoup(html, "html.parser")
 
     candidates = []
+    possible = []
+
     for a in soup.select("a[href]"):
         href = a.get("href", "")
         full = urljoin(current_url, href)
@@ -612,7 +655,6 @@ def get_subforum_next_page_url(html: str, current_url: str) -> Optional[str]:
     if current_t is not None:
         current_start_int = int(current_nt_start) if current_nt_start and current_nt_start.isdigit() else 0
 
-        possible = []
         for a in soup.select("a[href]"):
             full = urljoin(current_url, a.get("href", ""))
             if not SHOW_TOPIC_LIST_RE.search(full):
@@ -725,41 +767,23 @@ def extract_comment_from_table(table: Tag, topic_page_url: str) -> Optional[Dict
         if m_author:
             author = clean_text(m_author.group(1))
 
-    date_patterns = [
-        r"\b\d+\s+perce\b",
-        r"\b\d+\s+órája\b",
-        r"\b\d+\s+napja\b",
-        r"\b\d+\s+hete\b",
-        r"\b\d+\s+hónapja\b",
-        r"\b\d+\s+éve\b",
-        r"\b[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.? ?[0-9]{0,2}:?[0-9]{0,2}\b",
-    ]
-    for pat in date_patterns:
-        m = re.search(pat, header_text, flags=re.I)
-        if m:
-            date_text = clean_text(m.group(0))
-            break
+    m_abs_date = ABSOLUTE_DATE_RE.search(header_text)
+    if m_abs_date:
+        date_text = clean_text(m_abs_date.group(0))
+    else:
+        m_rel_date = RELATIVE_DATE_RE.search(header_text)
+        if m_rel_date:
+            date_text = clean_text(m_rel_date.group(0))
 
-    nums = re.findall(r"(?<![#\d])-?\d+(?!\d)", header_text)
-    small_nums = []
-    for n in nums:
-        try:
-            iv = int(n)
-            if -5000 <= iv <= 5000:
-                small_nums.append(iv)
-        except ValueError:
-            pass
+    likes, dislikes, score = parse_votes_from_header_row(header_row)
 
-    if small_nums:
-        negatives = [x for x in small_nums if x < 0]
-        positives = [x for x in small_nums if x > 0]
-        dislikes = abs(negatives[0]) if negatives else 0
-        likes = positives[-1] if positives else 0
-        score = likes - dislikes
-
-    id_candidates = re.findall(r"\b\d{4,}\b", header_text)
-    if id_candidates:
-        comment_id = id_candidates[-1]
+    nr_span = header_row.select_one("span.art_nr") if header_row else None
+    if nr_span:
+        comment_id = clean_text(nr_span.get_text(" ", strip=True))
+    else:
+        id_candidates = re.findall(r"\b\d{4,}\b", header_text)
+        if id_candidates:
+            comment_id = id_candidates[-1]
 
     body_candidates: List[str] = []
     for node in table.select("div.art_t, div.art_body, td[colspan='3'] div, p"):
@@ -1160,4 +1184,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
     #python index_scraper.py --output ./index --delay 1.5
