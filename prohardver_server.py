@@ -1,15 +1,20 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
+import gc
+import json
 import re
 import sys
-import time
+import textwrap
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
-from urllib.parse import urljoin
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
-import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 BASE_LIST_URL = "https://prohardver.hu/temak/notebook/listaz.php"
 
@@ -18,8 +23,13 @@ HSZ_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-RANGE_ONLY_RE = re.compile(r"^(\d+)-(\d+)$")
+URL_FIELD_RE = re.compile(r'"url"\s*:\s*"([^"]+)"')
+NEXT_URL_FIELD_RE = re.compile(r'"next_resume_url"\s*:\s*(?:"([^"]+)"|null)')
 
+
+# -----------------------------
+# Általános segédfüggvények
+# -----------------------------
 
 def build_list_url(offset: int) -> str:
     return BASE_LIST_URL if offset <= 0 else f"{BASE_LIST_URL}?offset={offset}"
@@ -35,7 +45,7 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def sanitize_filename(name: str, max_len: int = 140) -> str:
+def sanitize_filename(name: str, max_len: int = 180) -> str:
     name = clean_text(name)
     if not name:
         return "ismeretlen_topic"
@@ -65,28 +75,231 @@ def sanitize_filename(name: str, max_len: int = 140) -> str:
     return name or "ismeretlen_topic"
 
 
-def make_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": (
+def split_name_like_person(name: str) -> Dict[str, str]:
+    name = clean_text(name)
+    if not name:
+        return {"name": ""}
+
+    parts = name.split()
+    if len(parts) >= 2:
+        return {"family": parts[0], "given": " ".join(parts[1:])}
+    return {"name": name}
+
+
+def now_local_iso() -> str:
+    return datetime.now().astimezone().isoformat()
+
+
+def strip_fragment(url: str) -> str:
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, parsed.query, ""))
+
+
+def extract_query_param(url: str, key: str) -> Optional[str]:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    vals = query.get(key)
+    return vals[0] if vals else None
+
+
+def set_query_param(url: str, key: str, value: str) -> str:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    query[key] = [value]
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(query, doseq=True),
+            "",
+        )
+    )
+
+
+# -----------------------------
+# Playwright wrapper
+# -----------------------------
+
+class BrowserFetcher:
+    def __init__(
+        self,
+        headless: bool = True,
+        slow_mo: int = 0,
+        timeout_ms: int = 90000,
+        retries: int = 4,
+        block_resources: bool = True,
+        auto_reset_fetches: int = 120,
+    ):
+        self.headless = headless
+        self.slow_mo = slow_mo
+        self.timeout_ms = timeout_ms
+        self.retries = retries
+        self.block_resources = block_resources
+        self.auto_reset_fetches = auto_reset_fetches
+
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.fetch_counter = 0
+
+    def __enter__(self):
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(
+            headless=self.headless,
+            slow_mo=self.slow_mo,
+            args=[
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        self._create_context_and_page()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.page:
+                self.page.close()
+        except Exception:
+            pass
+        try:
+            if self.context:
+                self.context.close()
+        except Exception:
+            pass
+        try:
+            if self.browser:
+                self.browser.close()
+        except Exception:
+            pass
+        try:
+            if self.playwright:
+                self.playwright.stop()
+        except Exception:
+            pass
+
+    def _create_context_and_page(self) -> None:
+        self.context = self.browser.new_context(
+            locale="hu-HU",
+            user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/136.0.0.0 Safari/537.36"
             ),
-            "Accept-Language": "hu-HU,hu;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": "https://prohardver.hu/",
-        }
-    )
-    return session
+            viewport={"width": 1600, "height": 2200},
+        )
+
+        if self.block_resources:
+            def route_handler(route):
+                try:
+                    req = route.request
+                    if req.resource_type in {"image", "media", "font"}:
+                        route.abort()
+                    else:
+                        route.continue_()
+                except Exception:
+                    try:
+                        route.continue_()
+                    except Exception:
+                        pass
+
+            self.context.route("**/*", route_handler)
+
+        self.page = self.context.new_page()
+        self.page.set_default_timeout(self.timeout_ms)
+        self.page.set_default_navigation_timeout(self.timeout_ms)
+
+    def reset_page(self) -> None:
+        try:
+            if self.page:
+                self.page.close()
+        except Exception:
+            pass
+
+        self.page = self.context.new_page()
+        self.page.set_default_timeout(self.timeout_ms)
+        self.page.set_default_navigation_timeout(self.timeout_ms)
+        print("[INFO] Böngészőoldal újranyitva a stabilabb működéshez.")
+
+    def reset_context(self) -> None:
+        try:
+            if self.page:
+                self.page.close()
+        except Exception:
+            pass
+        self.page = None
+
+        try:
+            if self.context:
+                self.context.close()
+        except Exception:
+            pass
+        self.context = None
+
+        self._create_context_and_page()
+        gc.collect()
+        print("[INFO] Browser context teljesen újranyitva memória-kíméléshez.")
+
+    def fetch(self, url: str, wait_ms: int = 1500) -> Tuple[str, str]:
+        last_exc = None
+
+        if self.auto_reset_fetches > 0 and self.fetch_counter > 0 and self.fetch_counter % self.auto_reset_fetches == 0:
+            print("[INFO] Automatikus context-reset a fetch számláló alapján.")
+            self.reset_context()
+
+        for attempt in range(1, self.retries + 1):
+            try:
+                print(f"[DEBUG] LETÖLTVE ({attempt}/{self.retries}): {url}")
+                self.page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+                self.page.wait_for_timeout(wait_ms)
+
+                try:
+                    self.page.wait_for_load_state("networkidle", timeout=5000)
+                except PlaywrightTimeoutError:
+                    pass
+
+                final_url = self.page.url
+                html = self.page.content()
+                self.fetch_counter += 1
+                return final_url, html
+
+            except PlaywrightTimeoutError as e:
+                last_exc = e
+                print(f"[WARN] Timeout ({attempt}/{self.retries}) -> {url}")
+            except Exception as e:
+                last_exc = e
+                print(f"[WARN] Fetch hiba ({attempt}/{self.retries}) -> {url} | {e}")
+
+            if attempt < self.retries:
+                backoff_ms = 3000 * attempt
+                print(f"[WARN] Újrapróbálás {backoff_ms / 1000:.1f} mp múlva...")
+
+                try:
+                    self.page.wait_for_timeout(backoff_ms)
+                except Exception:
+                    pass
+
+                try:
+                    self.page.goto("about:blank", timeout=10000)
+                except Exception:
+                    pass
+
+                try:
+                    self.reset_page()
+                except Exception:
+                    pass
+
+        raise last_exc
 
 
-def fetch(session: requests.Session, url: str, timeout: int = 60) -> Tuple[str, str]:
-    r = session.get(url, timeout=timeout, allow_redirects=True)
-    r.raise_for_status()
-    r.encoding = r.apparent_encoding or r.encoding or "utf-8"
-    return r.url, r.text
-
+# -----------------------------
+# DOM / parse segédek
+# -----------------------------
 
 def parse_topic_links(html: str, page_url: str) -> List[Tuple[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
@@ -95,6 +308,7 @@ def parse_topic_links(html: str, page_url: str) -> List[Tuple[str, str]]:
         "div.col.thread-title-thread h4 a[href*='/tema/']",
         "main h4 a[href*='/tema/']",
         "h4 a[href*='/tema/']",
+        "a[href*='/tema/']",
     ]
 
     anchors = []
@@ -119,28 +333,17 @@ def parse_topic_links(html: str, page_url: str) -> List[Tuple[str, str]]:
         if not title:
             continue
 
-        if full_url in seen:
+        norm = normalize_topic_base_url(full_url)
+        if norm in seen:
             continue
 
-        seen.add(full_url)
-        topics.append((title, full_url))
+        seen.add(norm)
+        topics.append((title, norm))
 
     return topics[:100]
 
 
-def page_has_messages_html(html: str) -> bool:
-    soup = BeautifulSoup(html, "html.parser")
-    return len(soup.select("li.media[data-id]")) > 0
-
-
-def is_404_html(html: str) -> bool:
-    soup = BeautifulSoup(html, "html.parser")
-    title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "").lower()
-    body_text = clean_text(soup.get_text("\n", strip=True)).lower()
-    return "404" in title or "404 not found" in body_text or "a kért oldal nem létezik" in body_text
-
-
-def extract_topic_title_from_html(html: str, fallback: str) -> str:
+def extract_topic_title(html: str, fallback: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for selector in ["meta[property='og:title']", "title", "h1"]:
         node = soup.select_one(selector)
@@ -159,7 +362,17 @@ def extract_topic_title_from_html(html: str, fallback: str) -> str:
     return fallback
 
 
-def extract_author(post) -> str:
+def page_has_messages_html(html: str) -> bool:
+    soup = BeautifulSoup(html, "html.parser")
+    return bool(soup.select("li.media[data-id]"))
+
+
+def is_404_html(html: str) -> bool:
+    text = clean_text(BeautifulSoup(html, "html.parser").get_text(" ", strip=True)).lower()
+    return "404" in text or "a kért oldal nem létezik" in text
+
+
+def extract_author(post: Tag) -> str:
     header = post.select_one(".msg-header")
     if header:
         header_text = clean_text(header.get_text(" ", strip=True))
@@ -180,7 +393,68 @@ def extract_author(post) -> str:
     return "ismeretlen"
 
 
-def extract_comment_text(post) -> str:
+def extract_comment_date(post: Tag) -> Optional[str]:
+    header = post.select_one(".msg-header")
+    if header:
+        header_text = clean_text(header.get_text(" ", strip=True))
+        patterns = [
+            r"\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\b",
+            r"\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}\b",
+            r"\b\d{4}\.\d{2}\.\d{2}\.?(?: \d{2}:\d{2}(?::\d{2})?)?\b",
+            r"\bma,? \d{1,2}:\d{2}\b",
+            r"\btegnap,? \d{1,2}:\d{2}\b",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, header_text, flags=re.I)
+            if m:
+                return clean_text(m.group(0))
+
+    for selector in ["time", ".msg-date", ".date"]:
+        node = post.select_one(selector)
+        if not node:
+            continue
+        text = clean_text(node.get_text(" ", strip=True) or node.get("datetime", ""))
+        if text:
+            return text
+
+    return None
+
+
+def extract_comment_likes(post: Tag) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    text = clean_text(post.get_text(" ", strip=True))
+
+    likes = None
+    dislikes = None
+
+    patterns_like = [
+        r"\bLike(?:ok)?\s*[:\-]?\s*(\d+)\b",
+        r"\bTetszik\s*[:\-]?\s*(\d+)\b",
+    ]
+    patterns_dislike = [
+        r"\bDislike(?:ok)?\s*[:\-]?\s*(\d+)\b",
+        r"\bNem tetszik\s*[:\-]?\s*(\d+)\b",
+    ]
+
+    for pattern in patterns_like:
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            likes = int(m.group(1))
+            break
+
+    for pattern in patterns_dislike:
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            dislikes = int(m.group(1))
+            break
+
+    score = None
+    if likes is not None or dislikes is not None:
+        score = (likes or 0) - (dislikes or 0)
+
+    return likes, dislikes, score
+
+
+def extract_comment_text(post: Tag) -> str:
     for selector in [".msg-content p.mgt0", ".msg-content", "p.mgt0"]:
         nodes = post.select(selector)
         if not nodes:
@@ -201,10 +475,17 @@ def extract_comment_text(post) -> str:
     return ""
 
 
-def parse_comments_from_html(html: str) -> List[Tuple[str, str, str]]:
+def comment_url_from_page(current_url: str, post_id: str) -> str:
+    base = strip_fragment(current_url)
+    if post_id:
+        return f"{base}#msg{post_id}"
+    return base
+
+
+def parse_comments_from_html(html: str, current_url: str, next_resume_url: Optional[str]) -> List[Dict]:
     soup = BeautifulSoup(html, "html.parser")
     posts = soup.select("li.media[data-id]")
-    results: List[Tuple[str, str, str]] = []
+    results: List[Dict] = []
 
     print(f"[DEBUG] Talált li.media[data-id] elemek száma: {len(posts)}")
 
@@ -212,49 +493,35 @@ def parse_comments_from_html(html: str) -> List[Tuple[str, str, str]]:
         post_id = clean_text(post.get("data-id", ""))
         author = extract_author(post)
         comment = extract_comment_text(post)
+        date_text = extract_comment_date(post)
+        likes, dislikes, score = extract_comment_likes(post)
 
         preview = comment[:120].replace("\n", " | ") if comment else "<üres>"
-        print(f"[DEBUG] Poszt #{index} | data-id={post_id or '-'} | szerző={author} | preview={preview}")
+        print(
+            f"[DEBUG] Poszt #{index} | data-id={post_id or '-'} | szerző={author} | "
+            f"dátum={date_text or '-'} | like={likes} | preview={preview}"
+        )
 
         if not comment:
             continue
 
-        results.append((post_id, author, comment))
+        results.append(
+            {
+                "comment_id": post_id or None,
+                "author": author,
+                "date": date_text,
+                "likes": likes,
+                "dislikes": dislikes,
+                "score": score,
+                "url": comment_url_from_page(current_url, post_id),
+                "page_url": strip_fragment(current_url),
+                "next_resume_url": next_resume_url,
+                "data": comment,
+            }
+        )
 
     print(f"[DEBUG] Kinyert kommentek ezen az oldalon: {len(results)}")
     return results
-
-
-def get_next_page_url_from_html(html: str, current_url: str) -> Optional[str]:
-    soup = BeautifulSoup(html, "html.parser")
-
-    selectors = [
-        "a[rel='next']",
-        "a[title*='Következő blokk']",
-        "li.nav-arrow a[rel='next']",
-    ]
-
-    for selector in selectors:
-        a = soup.select_one(selector)
-        if a and a.get("href"):
-            return urljoin(current_url, a["href"])
-
-    current_range = parse_hsz_range_from_url(current_url)
-    if current_range:
-        cur_start, cur_end = current_range
-        for a in soup.select("a[href*='/hsz_']"):
-            href = a.get("href")
-            if not href:
-                continue
-            full = urljoin(current_url, href)
-            rng = parse_hsz_range_from_url(full)
-            if not rng:
-                continue
-            start, end = rng
-            if start < cur_start and end < cur_end:
-                return full
-
-    return None
 
 
 def parse_hsz_range_from_url(url: str) -> Optional[Tuple[int, int]]:
@@ -265,17 +532,16 @@ def parse_hsz_range_from_url(url: str) -> Optional[Tuple[int, int]]:
 
 
 def build_hsz_url_with_range(current_url: str, start: int, end: int) -> Optional[str]:
-    m = HSZ_URL_RE.match(current_url)
+    m = HSZ_URL_RE.match(strip_fragment(current_url))
     if not m:
         return None
-
     prefix = m.group("prefix")
     suffix = m.group("suffix")
     return f"{prefix}{start}-{end}{suffix}#msg{end + 1}"
 
 
 def normalize_topic_base_url(topic_url: str) -> str:
-    base = topic_url.split("#")[0].rstrip("/")
+    base = strip_fragment(topic_url).rstrip("/")
     base = re.sub(r"/friss\.html$", "", base, flags=re.I)
     base = re.sub(r"/hsz_\d+-\d+\.html$", "", base, flags=re.I)
     return base
@@ -299,7 +565,7 @@ def build_prev_range_from_saved(saved_start: int, saved_end: int) -> Optional[Tu
 
 
 def build_fallback_next_hsz_url(current_url: str) -> Optional[str]:
-    parsed = parse_hsz_range_from_url(current_url)
+    parsed = parse_hsz_range_from_url(strip_fragment(current_url))
     if not parsed:
         return None
 
@@ -311,6 +577,32 @@ def build_fallback_next_hsz_url(current_url: str) -> Optional[str]:
 
     return build_hsz_url_with_range(current_url, new_start, new_end)
 
+
+def get_next_page_href_from_html(html: str, current_url: str) -> Optional[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    selectors = [
+        "a[rel='next']",
+        "li.nav-arrow a[rel='next']",
+        "a[title*='Következő blokk']",
+        "a[href*='/hsz_']",
+    ]
+
+    for selector in selectors:
+        for a in soup.select(selector):
+            href = a.get("href")
+            if not href:
+                continue
+            full = urljoin(current_url, href)
+            if "/hsz_" in full:
+                return strip_fragment(full)
+
+    fallback_url = build_fallback_next_hsz_url(current_url)
+    return strip_fragment(fallback_url) if fallback_url else None
+
+
+# -----------------------------
+# Fájl / output kezelés
+# -----------------------------
 
 def ensure_output_dirs(base_output: Path) -> Tuple[Path, Path, Path]:
     prohardver_dir = base_output / "prohardver"
@@ -329,7 +621,6 @@ def ensure_output_dirs(base_output: Path) -> Tuple[Path, Path, Path]:
 def load_visited(visited_file: Path) -> Set[str]:
     if not visited_file.exists():
         return set()
-
     return {
         line.strip()
         for line in visited_file.read_text(encoding="utf-8").splitlines()
@@ -342,315 +633,362 @@ def append_visited(visited_file: Path, topic_url: str) -> None:
         f.write(topic_url.strip() + "\n")
 
 
+def normalize_topic_url_for_visited(topic_url: str) -> str:
+    return normalize_topic_base_url(topic_url)
+
+
 def topic_file_path(notebooks_dir: Path, title: str) -> Path:
-    return notebooks_dir / f"{sanitize_filename(title)}.txt"
+    return notebooks_dir / f"{sanitize_filename(title)}.json"
 
 
-def ensure_topic_metadata(topic_file: Path, title: str, topic_url: str) -> None:
-    now_str = datetime.now().strftime("%Y.%m.%d")
+def read_tail_text(path: Path, max_bytes: int = 1024 * 1024) -> str:
+    if not path.exists():
+        return ""
 
-    if not topic_file.exists():
-        topic_file.write_text(
-            f"--visited--{now_str}\nTopic:\n{title}\nURL:\n{topic_url}\n\n",
-            encoding="utf-8",
-        )
-        return
+    size = path.stat().st_size
+    with path.open("rb") as f:
+        if size > max_bytes:
+            f.seek(size - max_bytes)
+        data = f.read()
 
-    text = topic_file.read_text(encoding="utf-8")
-    if not text.strip():
-        topic_file.write_text(
-            f"--visited--{now_str}\nTopic:\n{title}\nURL:\n{topic_url}\n\n",
-            encoding="utf-8",
-        )
-        return
-
-    lines = text.splitlines()
-    if lines and lines[0].startswith("--visited--"):
-        lines[0] = f"--visited--{now_str}"
-        topic_file.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    else:
-        topic_file.write_text(
-            f"--visited--{now_str}\nTopic:\n{title}\nURL:\n{topic_url}\n\n{text}",
-            encoding="utf-8",
-        )
+    return data.decode("utf-8", errors="ignore")
 
 
-def get_last_nonempty_line(topic_file: Path) -> Optional[str]:
-    if not topic_file.exists():
+def file_looks_closed_json(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+
+    tail = read_tail_text(path, max_bytes=65536).rstrip()
+    if not tail.endswith("}"):
+        return False
+
+    required_markers = [
+        '"comments": [',
+        '"origin": "prohardver_forum"',
+        '"scrape_status": "finished"',
+    ]
+    full_sample = read_tail_text(path, max_bytes=512 * 1024)
+    return all(marker in tail or marker in full_sample for marker in required_markers)
+
+
+def find_last_comment_url_from_file(path: Path) -> Optional[str]:
+    tail = read_tail_text(path, max_bytes=2 * 1024 * 1024)
+    matches = URL_FIELD_RE.findall(tail)
+    if not matches:
         return None
 
-    lines = topic_file.read_text(encoding="utf-8").splitlines()
-    for line in reversed(lines):
-        stripped = line.strip()
-        if stripped:
-            return stripped
+    for url in reversed(matches):
+        if "#msg" in url and ("/hsz_" in url or "/friss.html" in url):
+            return url
+
+    for url in reversed(matches):
+        if "/hsz_" in url or "/friss.html" in url:
+            return url
 
     return None
 
 
-def read_resume_range_from_last_line(topic_file: Path) -> Optional[Tuple[int, int]]:
-    last_line = get_last_nonempty_line(topic_file)
-    if not last_line:
+def find_last_next_resume_url_from_file(path: Path) -> Optional[str]:
+    tail = read_tail_text(path, max_bytes=2 * 1024 * 1024)
+    matches = NEXT_URL_FIELD_RE.findall(tail)
+    if not matches:
         return None
 
-    m = RANGE_ONLY_RE.match(last_line)
-    if not m:
+    for value in reversed(matches):
+        cleaned = clean_text(value)
+        if cleaned and cleaned.lower() != "null":
+            return cleaned
+    return None
+
+
+def init_open_json_file_if_needed(topic_file: Path, resolved_title: str, topic_url: str) -> None:
+    if topic_file.exists() and topic_file.stat().st_size > 0:
+        return
+
+    header_obj = {
+        "title": resolved_title,
+        "authors": [],
+        "data": {
+            "content": resolved_title,
+            "likes": None,
+            "dislikes": None,
+            "score": None,
+            "date": None,
+            "url": topic_url,
+            "language": "hu",
+            "tags": [],
+            "rights": "PROHARDVER! fórum tartalom",
+            "extra": {},
+            "origin": "prohardver_forum",
+        },
+    }
+
+    with topic_file.open("w", encoding="utf-8") as f:
+        f.write("{\n")
+        f.write(f'  "title": {json.dumps(header_obj["title"], ensure_ascii=False)},\n')
+        f.write(f'  "authors": {json.dumps(header_obj["authors"], ensure_ascii=False, indent=2)},\n')
+        f.write(f'  "data": {json.dumps(header_obj["data"], ensure_ascii=False, indent=2)},\n')
+        f.write('  "comments": [\n')
+
+
+def append_comments_page_to_open_json(topic_file: Path, comments: List[Dict], first_comment_already_written: bool) -> bool:
+    if not comments:
+        return first_comment_already_written
+
+    with topic_file.open("a", encoding="utf-8") as f:
+        for comment in comments:
+            json_comment = {
+                "authors": [split_name_like_person(comment.get("author") or "ismeretlen")],
+                "data": comment.get("data"),
+                "likes": comment.get("likes"),
+                "dislikes": comment.get("dislikes"),
+                "score": comment.get("score"),
+                "date": comment.get("date"),
+                "url": comment.get("url"),
+                "language": "hu",
+                "tags": [],
+                "extra": {
+                    "comment_id": comment.get("comment_id"),
+                    "page_url": comment.get("page_url"),
+                    "next_resume_url": comment.get("next_resume_url"),
+                },
+            }
+
+            if first_comment_already_written:
+                f.write(",\n")
+            f.write(textwrap.indent(json.dumps(json_comment, ensure_ascii=False, indent=4), "    "))
+            first_comment_already_written = True
+
+    return first_comment_already_written
+
+
+def close_topic_json_file(topic_file: Path, saved_comment_pages: int, resume_source: Optional[str]) -> None:
+    with topic_file.open("a", encoding="utf-8") as f:
+        f.write("\n  ],\n")
+        f.write('  "origin": "prohardver_forum",\n')
+        f.write('  "extra": {\n')
+        f.write('    "scrape_status": "finished",\n')
+        f.write(f'    "saved_comment_pages": {saved_comment_pages},\n')
+        f.write(f'    "resume_source": {json.dumps(resume_source, ensure_ascii=False)},\n')
+        f.write(f'    "date_modified": {json.dumps(now_local_iso(), ensure_ascii=False)}\n')
+        f.write("  }\n")
+        f.write("}\n")
+
+
+def derive_next_page_from_comment_url(comment_url: str) -> Optional[str]:
+    if not comment_url:
         return None
 
-    return int(m.group(1)), int(m.group(2))
+    base_url = strip_fragment(comment_url)
+    parsed = parse_hsz_range_from_url(base_url)
+    if not parsed:
+        return None
 
-
-def remove_trailing_range_line(topic_file: Path) -> None:
-    if not topic_file.exists():
-        return
-
-    lines = topic_file.read_text(encoding="utf-8").splitlines()
-    while lines and not lines[-1].strip():
-        lines.pop()
-
-    if lines and RANGE_ONLY_RE.match(lines[-1].strip()):
-        lines.pop()
-
-    text = "\n".join(lines).rstrip()
-    if text:
-        text += "\n"
-    topic_file.write_text(text, encoding="utf-8")
-
-
-def append_page_and_range(
-    topic_file: Path,
-    page_range: Tuple[int, int],
-    comments: List[Tuple[str, str, str]],
-) -> None:
-    remove_trailing_range_line(topic_file)
-
-    existing = topic_file.read_text(encoding="utf-8") if topic_file.exists() else ""
-    existing = existing.rstrip()
-
-    block_lines = []
-    for _, author, comment in comments:
-        block_lines.append("Comment:")
-        block_lines.append(f"{author}: {comment}")
-        block_lines.append("")
-
-    start, end = page_range
-
-    parts = []
-    if existing:
-        parts.append(existing)
-    if block_lines:
-        parts.append("\n".join(block_lines).rstrip())
-    parts.append(f"{start}-{end}")
-
-    new_text = "\n\n".join(part for part in parts if part).rstrip() + "\n"
-    topic_file.write_text(new_text, encoding="utf-8")
-
-
-def finalize_topic_file(topic_file: Path, title: str, topic_url: str) -> None:
-    if not topic_file.exists():
-        return
-
-    remove_trailing_range_line(topic_file)
-
-    now_str = datetime.now().strftime("%Y.%m.%d")
-    text = topic_file.read_text(encoding="utf-8")
-    lines = text.splitlines()
-
-    if lines:
-        if lines[0].startswith("--visited--"):
-            lines[0] = f"--visited--{now_str}"
-        else:
-            lines = [f"--visited--{now_str}", "Topic:", title, "URL:", topic_url, ""] + lines
-    else:
-        lines = [f"--visited--{now_str}", "Topic:", title, "URL:", topic_url, ""]
-
-    topic_file.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-
-
-def resolve_resume_url(topic_url: str, topic_file: Path) -> str:
-    resume_range = read_resume_range_from_last_line(topic_file)
-    if not resume_range:
-        return build_fresh_url_from_topic_url(topic_url)
-
-    saved_start, saved_end = resume_range
-    print(f"[DEBUG] Resume range megtalálva a fájl végén: {saved_start}-{saved_end}")
-
-    prev_range = build_prev_range_from_saved(saved_start, saved_end)
+    start, end = parsed
+    prev_range = build_prev_range_from_saved(start, end)
     if not prev_range:
-        print("[DEBUG] A mentett range-ből már nem lehet 100-zal visszalépni, indul a friss.html oldalról.")
-        return build_fresh_url_from_topic_url(topic_url)
+        return None
 
     new_start, new_end = prev_range
-    fixed_url = build_hsz_url_from_topic_url(topic_url, new_start, new_end)
-    print(f"[DEBUG] Resume URL (100-zal visszaléptetve): {fixed_url}")
-    return fixed_url
+    return build_hsz_url_from_topic_url(base_url, new_start, new_end)
 
 
-def open_topic_start_page(
-    session: requests.Session,
-    topic_url: str,
-    topic_file: Path,
-    delay: float,
-) -> Tuple[str, str]:
-    start_url = resolve_resume_url(topic_url, topic_file)
+def resolve_resume_url(topic_url: str, topic_file: Path) -> Tuple[str, Optional[str], bool]:
+    if topic_file.exists() and topic_file.stat().st_size > 0:
+        if file_looks_closed_json(topic_file):
+            return build_fresh_url_from_topic_url(topic_url), "already_closed", True
+
+        next_resume_url = find_last_next_resume_url_from_file(topic_file)
+        if next_resume_url:
+            print(f"[INFO] Resume: next_resume_url alapján innen folytatva: {next_resume_url}")
+            return next_resume_url, "existing_json_next_resume_url", False
+
+        last_comment_url = find_last_comment_url_from_file(topic_file)
+        if last_comment_url:
+            derived = derive_next_page_from_comment_url(last_comment_url)
+            if derived:
+                print(f"[INFO] Resume: utolsó komment URL alapján innen folytatva: {derived}")
+                return derived, "existing_json_last_comment_url", False
+
+        print("[INFO] Van meglévő félkész fájl, de nem találtam benne használható resume pontot. Friss oldalról indul.")
+
+    return build_fresh_url_from_topic_url(topic_url), None, False
+
+
+def open_topic_start_page(fetcher: BrowserFetcher, topic_url: str, topic_file: Path, delay: float) -> Tuple[str, str, Optional[str], bool]:
+    start_url, resume_source, already_closed = resolve_resume_url(topic_url, topic_file)
+    if already_closed:
+        return start_url, "", resume_source, True
+
     fresh_url = build_fresh_url_from_topic_url(topic_url)
 
     print(f"[DEBUG] Topic megnyitása: {start_url}")
-    final_url, html = fetch(session, start_url)
+    current_url, html = fetcher.fetch(start_url, wait_ms=int(delay * 1000))
 
     if is_404_html(html) or not page_has_messages_html(html):
         if start_url != fresh_url:
             print(f"[DEBUG] A resume URL nem adott használható kommentoldalt, fallback friss.html-re: {fresh_url}")
-            final_url, html = fetch(session, fresh_url)
+            current_url, html = fetcher.fetch(fresh_url, wait_ms=int(delay * 1000))
+            resume_source = "fallback_to_fresh"
 
-    time.sleep(delay)
-    return final_url, html
+    if not page_has_messages_html(html):
+        raise RuntimeError("Nem található kommentoldal a topichoz.")
 
-
-def try_go_to_next_page(
-    session: requests.Session,
-    current_url: str,
-    current_html: str,
-    delay: float,
-) -> Tuple[Optional[bool], Optional[str], Optional[str]]:
-    next_url = get_next_page_url_from_html(current_html, current_url)
-    if next_url:
-        print(f"[DEBUG] Következő oldal link megvan: {next_url}")
-        try:
-            final_url, html = fetch(session, next_url)
-            time.sleep(delay)
-            if final_url != current_url:
-                return True, final_url, html
-            return False, current_url, current_html
-        except Exception as e:
-            print(f"[DEBUG] Következő oldal letöltési hiba: {e}")
-            return None, None, None
-
-    fallback_url = build_fallback_next_hsz_url(current_url)
-    if not fallback_url:
-        print("[DEBUG] Nincs következő link, és URL fallback sem készíthető.")
-        return False, current_url, current_html
-
-    print(f"[DEBUG] URL fallback próbálva: {fallback_url}")
-    try:
-        final_url, html = fetch(session, fallback_url)
-        time.sleep(delay)
-        if final_url != current_url and page_has_messages_html(html):
-            return True, final_url, html
-        return False, current_url, current_html
-    except Exception as e:
-        print(f"[DEBUG] URL fallback hiba: {e}")
-        return None, None, None
+    return current_url, html, resume_source, False
 
 
-def scrape_topic_sequentially(
-    session: requests.Session,
-    topic_title: str,
-    topic_url: str,
-    topic_file: Path,
-    delay: float,
-) -> Tuple[str, bool]:
-    current_url, html = open_topic_start_page(session, topic_url, topic_file, delay)
-    print(f"[DEBUG] Ténylegesen megnyitott kezdőoldal: {current_url}")
+def scrape_topic_sequentially(fetcher: BrowserFetcher, topic_title: str, topic_url: str, topic_file: Path, delay: float, topic_reset_interval: int = 25) -> Tuple[str, bool]:
+    opened_url, html, resume_source, already_closed = open_topic_start_page(fetcher, topic_url, topic_file, delay)
+    if already_closed:
+        print("[INFO] A topic fájl már lezárt JSON, kihagyva.")
+        return topic_title, True
 
-    resolved_title = extract_topic_title_from_html(html, topic_title)
-    ensure_topic_metadata(topic_file, resolved_title, topic_url)
+    print(f"[DEBUG] Ténylegesen megnyitott kezdőoldal: {opened_url}")
+
+    resolved_title = extract_topic_title(html, topic_title)
+    init_open_json_file_if_needed(topic_file, resolved_title, topic_url)
+
+    first_comment_already_written = False
+    if topic_file.exists() and topic_file.stat().st_size > 0:
+        last_comment_url = find_last_comment_url_from_file(topic_file)
+        if last_comment_url:
+            first_comment_already_written = True
 
     visited_urls: Set[str] = set()
     page_index = 1
+    current_url = opened_url
+    current_html = html
 
     while True:
-        if current_url in visited_urls:
+        current_url_base = strip_fragment(current_url)
+        if current_url_base in visited_urls:
             print(f"[DEBUG] Már feldolgozott oldal, leállás: {current_url}")
             return resolved_title, False
 
-        visited_urls.add(current_url)
-        current_range = parse_hsz_range_from_url(current_url)
+        visited_urls.add(current_url_base)
+        next_resume_url = get_next_page_href_from_html(current_html, current_url)
 
         print(f"[DEBUG] Kommentoldal #{page_index}: {current_url}")
-        page_comments = parse_comments_from_html(html)
+        page_comments = parse_comments_from_html(current_html, current_url, next_resume_url)
 
-        if current_range:
-            append_page_and_range(topic_file, current_range, page_comments)
-            print(f"[DEBUG] Oldal mentve, új utolsó sor: {current_range[0]}-{current_range[1]}")
-        else:
-            print("[DEBUG] Ez a friss.html oldal, itt nincs számozott range, ezért ide nem kerül range sor.")
+        if page_comments:
+            first_comment_already_written = append_comments_page_to_open_json(
+                topic_file=topic_file,
+                comments=page_comments,
+                first_comment_already_written=first_comment_already_written,
+            )
 
-        moved, next_url, next_html = try_go_to_next_page(session, current_url, html, delay)
+        print(
+            f"[INFO] Oldal appendelve a JSON végére: {topic_file} | "
+            f"oldal kommentjei: {len(page_comments)}"
+        )
 
-        if moved is True:
-            page_index += 1
-            current_url = next_url
-            html = next_html
-            continue
+        if not next_resume_url:
+            print("[DEBUG] Nincs több oldal, topic véglegesítése.")
+            close_topic_json_file(topic_file=topic_file, saved_comment_pages=page_index, resume_source=resume_source)
+            really_closed = file_looks_closed_json(topic_file)
+            print(f"[INFO] Topic végleg lezárva: {topic_file} | lezárt={really_closed}")
+            return resolved_title, really_closed
 
-        if moved is False:
-            print("[DEBUG] Nincs több oldal, utolsó range törlése és topic véglegesítése.")
-            finalize_topic_file(topic_file, resolved_title, topic_url)
-            return resolved_title, True
+        print(f"[DEBUG] Következő kommentoldal: {next_resume_url}")
 
-        if moved is None:
-            print("[DEBUG] Letöltési vagy navigációs hiba történt, a topic NEM kerül a visitedbe.")
+        if topic_reset_interval > 0 and page_index % topic_reset_interval == 0:
+            print("[INFO] Hosszú topic közbeni memória-kímélő context reset.")
+            fetcher.reset_context()
+
+        try:
+            next_url, next_html = fetcher.fetch(next_resume_url, wait_ms=int(delay * 1000))
+        except Exception as e:
+            print(f"[DEBUG] Timeout vagy navigációs hiba történt: {e}")
             return resolved_title, False
 
+        if not page_has_messages_html(next_html):
+            print("[DEBUG] A következő oldal már nem tartalmaz kommenteket, topic véglegesítése.")
+            close_topic_json_file(topic_file=topic_file, saved_comment_pages=page_index, resume_source=resume_source)
+            really_closed = file_looks_closed_json(topic_file)
+            print(f"[INFO] Topic végleg lezárva: {topic_file} | lezárt={really_closed}")
+            return resolved_title, really_closed
 
-def scrape_offsets(start_offset: int, end_offset: int, output_dir: str, delay: float) -> None:
+        current_url, current_html = next_url, next_html
+        page_index += 1
+        gc.collect()
+
+
+def scrape_offsets(start_offset: int, end_offset: int, output_dir: str, delay: float, headless: bool, timeout_ms: int, retries: int, auto_reset_fetches: int, topic_reset_interval: int) -> None:
     base_output = Path(output_dir).expanduser().resolve()
     _, notebooks_dir, visited_file = ensure_output_dirs(base_output)
 
-    session = make_session()
     visited_topics = load_visited(visited_file)
+    visited_topics = {normalize_topic_url_for_visited(x) for x in visited_topics}
 
-    for offset in range(start_offset, end_offset + 1, 100):
-        list_url = build_list_url(offset)
-        print(f"\n[INFO] Listaoldal megnyitása: {list_url}")
-
-        try:
-            final_url, html = fetch(session, list_url)
-            time.sleep(delay)
-        except Exception as e:
-            print(f"[WARN] Hiba a listaoldalnál: {list_url} | {e}")
-            continue
-
-        topics = parse_topic_links(html, final_url)
-        print(f"[INFO] Talált topicok száma: {len(topics)}")
-        if not topics:
-            continue
-
-        for idx, (topic_title, topic_url) in enumerate(topics, start=1):
-            if topic_url in visited_topics:
-                print(f"[INFO] ({idx}/{len(topics)}) Már feldolgozva, kihagyva: {topic_title}")
-                continue
-
-            topic_file = topic_file_path(notebooks_dir, topic_title)
-            print(f"\n[INFO] ({idx}/{len(topics)}) Topic: {topic_title}")
+    with BrowserFetcher(
+        headless=headless,
+        slow_mo=0,
+        timeout_ms=timeout_ms,
+        retries=retries,
+        block_resources=True,
+        auto_reset_fetches=auto_reset_fetches,
+    ) as fetcher:
+        for offset in range(start_offset, end_offset + 1, 100):
+            list_url = build_list_url(offset)
+            print(f"\n[INFO] Listaoldal megnyitása: {list_url}")
 
             try:
-                resolved_title, finished = scrape_topic_sequentially(
-                    session, topic_title, topic_url, topic_file, delay
-                )
-
-                if sanitize_filename(resolved_title) != sanitize_filename(topic_title):
-                    new_path = topic_file_path(notebooks_dir, resolved_title)
-                    if new_path != topic_file and topic_file.exists():
-                        topic_file.replace(new_path)
-                        topic_file = new_path
-
-                print(f"[INFO] Topic fájl: {topic_file}")
-
-                if finished:
-                    append_visited(visited_file, topic_url)
-                    visited_topics.add(topic_url)
-                    print(f"[INFO] Topic teljesen feldolgozva, visitedbe írva: {resolved_title}")
-                else:
-                    print(f"[INFO] Topic nincs kész vagy hibával megállt, NEM kerül visitedbe: {resolved_title}")
-
+                fetcher.reset_context()
+                final_list_url, list_html = fetcher.fetch(list_url, wait_ms=int(delay * 1000))
             except Exception as e:
-                print(f"[WARN] Váratlan hiba a topicnál: {topic_url} | {e}")
+                print(f"[WARN] Hiba a listaoldalnál: {list_url} | {e}")
+                continue
+
+            topics = parse_topic_links(list_html, final_list_url)
+            print(f"[INFO] Talált topicok száma: {len(topics)}")
+            if not topics:
+                continue
+
+            for idx, (topic_title, topic_url) in enumerate(topics, start=1):
+                topic_url_norm = normalize_topic_url_for_visited(topic_url)
+                if topic_url_norm in visited_topics:
+                    print(f"[INFO] ({idx}/{len(topics)}) Már feldolgozva, kihagyva: {topic_title}")
+                    continue
+
+                topic_file = topic_file_path(notebooks_dir, topic_title)
+                print(f"\n[INFO] ({idx}/{len(topics)}) Topic: {topic_title}")
+
+                try:
+                    resolved_title, finished = scrape_topic_sequentially(
+                        fetcher=fetcher,
+                        topic_title=topic_title,
+                        topic_url=topic_url,
+                        topic_file=topic_file,
+                        delay=delay,
+                        topic_reset_interval=topic_reset_interval,
+                    )
+
+                    if sanitize_filename(resolved_title) != sanitize_filename(topic_title):
+                        new_path = topic_file_path(notebooks_dir, resolved_title)
+                        if new_path != topic_file and topic_file.exists():
+                            topic_file.replace(new_path)
+                            topic_file = new_path
+
+                    print(f"[INFO] Topic fájl: {topic_file}")
+
+                    if finished and file_looks_closed_json(topic_file):
+                        append_visited(visited_file, topic_url_norm)
+                        visited_topics.add(topic_url_norm)
+                        print(f"[INFO] Topic teljesen feldolgozva, visitedbe írva: {resolved_title}")
+                    else:
+                        print(f"[INFO] Topic nincs kész vagy hibával megállt, NEM kerül visitedbe: {resolved_title}")
+
+                except Exception as e:
+                    print(f"[WARN] Váratlan hiba a topicnál: {topic_url} | {e}")
+
+                gc.collect()
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="PROHARDVER notebook topic scraper requests + BeautifulSoup alapon.")
+    parser = argparse.ArgumentParser(
+        description="PROHARDVER notebook topic scraper Playwrighttel, appendelt JSON mentéssel."
+    )
     parser.add_argument("start_offset", type=int, help="Kezdő offset. Pl. 0 vagy 100")
     parser.add_argument("end_offset", type=int, help="Vég offset. Pl. 200 vagy 300")
     parser.add_argument(
@@ -659,6 +997,11 @@ def parse_args() -> argparse.Namespace:
         help="Kimeneti alapmappa. Ide jön létre a prohardver mappa. Alapértelmezett: aktuális mappa.",
     )
     parser.add_argument("--delay", type=float, default=1.2, help="Várakozás oldalak között másodpercben.")
+    parser.add_argument("--headed", action="store_true", help="Látható böngészőablakkal fusson.")
+    parser.add_argument("--timeout-ms", type=int, default=90000, help="Navigációs timeout ezredmásodpercben.")
+    parser.add_argument("--retries", type=int, default=4, help="Ennyiszer próbálja újra a fetch műveleteket.")
+    parser.add_argument("--topic-reset-interval", type=int, default=25, help="Ennyi kommentoldalanként teljes context reset hosszú topicoknál.")
+    parser.add_argument("--auto-reset-fetches", type=int, default=120, help="Ennyi fetch után automatikus context reset.")
     return parser.parse_args()
 
 
@@ -677,13 +1020,26 @@ def main() -> None:
         print("Az offsetek legyenek 100-zal oszthatók: 0, 100, 200, ...")
         sys.exit(1)
 
-    scrape_offsets(
-        start_offset=args.start_offset,
-        end_offset=args.end_offset,
-        output_dir=args.output,
-        delay=args.delay,
-    )
+    try:
+        scrape_offsets(
+            start_offset=args.start_offset,
+            end_offset=args.end_offset,
+            output_dir=args.output,
+            delay=args.delay,
+            headless=not args.headed,
+            timeout_ms=args.timeout_ms,
+            retries=args.retries,
+            auto_reset_fetches=args.auto_reset_fetches,
+            topic_reset_interval=args.topic_reset_interval,
+        )
+    except KeyboardInterrupt:
+        print("\n[INFO] Megszakítva felhasználó által.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[FATAL ERROR] {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+#python prohardver_server.py 0 6000 --output . --delay 1.2
