@@ -195,27 +195,32 @@ def file_looks_closed_json(path: Path) -> bool:
     if not tail.endswith("}"):
         return False
 
-    required_markers = [
-        '"comments": [',
+    required_tail_markers = [
         '"origin": "index_forum"',
         '"scrape_status": "finished"',
+        '"date_modified":',
     ]
-    return all(marker in tail or marker in read_tail_text(path, max_bytes=512 * 1024) for marker in required_markers)
+    return all(marker in tail for marker in required_tail_markers)
+
+
+def file_has_any_written_comment(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+
+    tail = read_tail_text(path, max_bytes=2 * 1024 * 1024)
+    return '"comment_id"' in tail
 
 
 def find_last_comment_url_from_file(path: Path) -> Optional[str]:
     tail = read_tail_text(path, max_bytes=2 * 1024 * 1024)
-    matches = URL_FIELD_RE.findall(tail)
-    if not matches:
-        return None
 
-    for url in reversed(matches):
-        if "#msg" in url and "showArticle" in url:
-            return url
-
-    for url in reversed(matches):
-        if "showArticle" in url:
-            return url
+    comment_blocks = re.findall(
+        r'"comment_id"\s*:\s*"[^"]+"\s*.*?"url"\s*:\s*"([^"]+)"',
+        tail,
+        flags=re.S,
+    )
+    if comment_blocks:
+        return comment_blocks[-1]
 
     return None
 
@@ -376,6 +381,46 @@ def parse_votes_from_header_row(header_row: Optional[Tag]) -> Tuple[Optional[int
     return likes, dislikes, score
 
 
+def is_bad_resolved_topic_title(title: str) -> bool:
+    title_norm = clean_text(title).strip().lower()
+
+    if not title_norm:
+        return True
+
+    bad_exact = {
+        "keresés",
+        "kereses",
+        "index fórum",
+        "index forum",
+        "forum",
+        "fórum",
+    }
+
+    if title_norm in bad_exact:
+        return True
+
+    bad_contains = [
+        "keresés",
+        "kereses",
+        "találat",
+        "search",
+    ]
+
+    if any(x in title_norm for x in bad_contains):
+        return True
+
+    return False
+
+
+def topic_page_looks_valid(html: str) -> bool:
+    soup = BeautifulSoup(html, "html.parser")
+    try:
+        tables = soup.select("table.art")
+        return len(tables) > 0
+    finally:
+        del soup
+
+
 class BrowserFetcher:
     def __init__(
         self,
@@ -397,7 +442,6 @@ class BrowserFetcher:
         self.browser = None
         self.context = None
         self.page = None
-
         self.fetch_counter = 0
 
     def __enter__(self):
@@ -770,14 +814,24 @@ def extract_topic_title(html: str, fallback: str) -> str:
         "h1",
         "title",
     ]
+
     for selector in selectors:
         node = soup.select_one(selector)
         if not node:
             continue
+
         text = clean_text(node.get_text(" ", strip=True))
         text = re.sub(r"\s*-\s*Index Fórum.*$", "", text, flags=re.I)
-        if text:
-            return text
+        text = clean_text(text)
+
+        if not text:
+            continue
+
+        if is_bad_resolved_topic_title(text):
+            continue
+
+        return text
+
     return fallback
 
 
@@ -1013,14 +1067,20 @@ def scrape_topic(
     print(f"[INFO] Topic megnyitása: {topic_title}")
     current_url, html = fetcher.fetch(topic_url, wait_ms=int(delay * 1000))
 
+    if not topic_page_looks_valid(html):
+        print(f"[WARN] A letöltött oldal nem tűnik valódi topic-oldalnak: {current_url}")
+
     resolved_title = extract_topic_title(html, topic_title)
+    if is_bad_resolved_topic_title(resolved_title):
+        print(f"[WARN] Gyanús feloldott topic cím, fallback az eredeti címre: {resolved_title!r}")
+        resolved_title = topic_title
+
     topic_meta = extract_topic_meta(html, topic_url)
 
     init_open_json_file_if_needed(topic_file, resolved_title, topic_meta, topic_url)
 
     if topic_file.stat().st_size > 0 and not first_comment_already_written:
-        last_comment_url = find_last_comment_url_from_file(topic_file)
-        if last_comment_url:
+        if file_has_any_written_comment(topic_file):
             first_comment_already_written = True
 
     page_no = start_page_no
@@ -1142,7 +1202,12 @@ def scrape_subforum(
                     topic_reset_interval=topic_reset_interval,
                 )
 
-                final_path = topic_file_path(subforum_dir, resolved_title)
+                safe_final_title = resolved_title
+                if is_bad_resolved_topic_title(safe_final_title):
+                    print(f"[WARN] Hibásnak tűnő végső cím miatt nincs átnevezés: {safe_final_title!r}")
+                    safe_final_title = topic_title
+
+                final_path = topic_file_path(subforum_dir, safe_final_title)
 
                 if final_path != initial_path and initial_path.exists():
                     initial_path.replace(final_path)
