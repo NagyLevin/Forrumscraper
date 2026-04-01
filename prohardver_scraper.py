@@ -629,6 +629,14 @@ def read_tail_text(path: Path, max_bytes: int = 1024 * 1024) -> str:
     return data.decode("utf-8", errors="ignore")
 
 
+def read_head_text(path: Path, max_bytes: int = 1024 * 1024) -> str:
+    if not path.exists():
+        return ""
+    with path.open("rb") as f:
+        data = f.read(max_bytes)
+    return data.decode("utf-8", errors="ignore")
+
+
 def file_looks_closed_json(path: Path) -> bool:
     if not path.exists() or path.stat().st_size == 0:
         return False
@@ -646,9 +654,37 @@ def file_looks_closed_json(path: Path) -> bool:
     return all(marker in tail or marker in full_sample for marker in required_markers)
 
 
+def file_has_any_saved_comment(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+
+    text = read_head_text(path, max_bytes=2 * 1024 * 1024)
+    marker = '"comments": ['
+    idx = text.find(marker)
+    if idx == -1:
+        return False
+
+    after = text[idx + len(marker):]
+    after = after.lstrip()
+
+    if not after:
+        return False
+
+    return after.startswith("{") or '"comment_id"' in after or '"page_url"' in after
+
+
 def find_last_comment_url_from_file(path: Path) -> Optional[str]:
-    tail = read_tail_text(path, max_bytes=2 * 1024 * 1024)
-    matches = URL_FIELD_RE.findall(tail)
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+
+    text = read_tail_text(path, max_bytes=2 * 1024 * 1024)
+
+    marker = '"comments": ['
+    idx = text.find(marker)
+    if idx != -1:
+        text = text[idx + len(marker):]
+
+    matches = URL_FIELD_RE.findall(text)
     if not matches:
         return None
 
@@ -664,8 +700,17 @@ def find_last_comment_url_from_file(path: Path) -> Optional[str]:
 
 
 def find_last_next_resume_url_from_file(path: Path) -> Optional[str]:
-    tail = read_tail_text(path, max_bytes=2 * 1024 * 1024)
-    matches = NEXT_URL_FIELD_RE.findall(tail)
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+
+    text = read_tail_text(path, max_bytes=2 * 1024 * 1024)
+
+    marker = '"comments": ['
+    idx = text.find(marker)
+    if idx != -1:
+        text = text[idx + len(marker):]
+
+    matches = NEXT_URL_FIELD_RE.findall(text)
     if not matches:
         return None
 
@@ -853,11 +898,7 @@ def scrape_topic_sequentially(
     resolved_title = extract_topic_title(driver, topic_title)
     init_open_json_file_if_needed(topic_file, resolved_title, topic_url)
 
-    first_comment_already_written = False
-    if topic_file.exists() and topic_file.stat().st_size > 0:
-        last_comment_url = find_last_comment_url_from_file(topic_file)
-        if last_comment_url:
-            first_comment_already_written = True
+    first_comment_already_written = file_has_any_saved_comment(topic_file)
 
     visited_urls: Set[str] = set()
     page_index = 1
